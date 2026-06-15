@@ -11,20 +11,22 @@
 // 支持欧氏距离和地理距离（大圆距离）两种坐标系。
 package kriging
 
-import (
-	"math"
-)
+import "math"
 
-// VariogramFunc is the function signature for a variogram model.
-// m contains the model parameters, d is the distance(s) at which to evaluate.
-type VariogramFunc func(m []float64, d []float64) []float64
+// VariogramFunc 是变异函数模型的函数签名。
+// m 是模型参数，d 是评估距离（可能多个）。
+type VariogramFunc func(m, d []float64) []float64
 
-// LinearVariogramModel implements the linear variogram model.
-// m = [slope, nugget]
-// γ(d) = slope * d + nugget
-func LinearVariogramModel(m []float64, d []float64) []float64 {
-	slope := m[0]
-	nugget := m[1]
+// variogramValue 计算单个距离值处的变异函数值，避免重复创建单元素切片。
+func variogramValue(fn VariogramFunc, params []float64, dist float64) float64 {
+	d := [1]float64{dist}
+	return fn(params, d[:])[0]
+}
+
+// LinearVariogramModel 线性变异函数模型。
+// m = [slope, nugget], γ(d) = slope * d + nugget
+func LinearVariogramModel(m, d []float64) []float64 {
+	slope, nugget := m[0], m[1]
 	result := make([]float64, len(d))
 	for i, dist := range d {
 		result[i] = slope*dist + nugget
@@ -32,13 +34,10 @@ func LinearVariogramModel(m []float64, d []float64) []float64 {
 	return result
 }
 
-// PowerVariogramModel implements the power variogram model.
-// m = [scale, exponent, nugget]
-// γ(d) = scale * d^exponent + nugget
-func PowerVariogramModel(m []float64, d []float64) []float64 {
-	scale := m[0]
-	exponent := m[1]
-	nugget := m[2]
+// PowerVariogramModel 幂变异函数模型。
+// m = [scale, exponent, nugget], γ(d) = scale * d^exponent + nugget
+func PowerVariogramModel(m, d []float64) []float64 {
+	scale, exponent, nugget := m[0], m[1], m[2]
 	result := make([]float64, len(d))
 	for i, dist := range d {
 		result[i] = scale*math.Pow(dist, exponent) + nugget
@@ -46,15 +45,11 @@ func PowerVariogramModel(m []float64, d []float64) []float64 {
 	return result
 }
 
-// GaussianVariogramModel implements the gaussian variogram model.
-// m = [psill, range, nugget]
-// γ(d) = psill * (1 - exp(-d² / (range*4/7)²)) + nugget
-func GaussianVariogramModel(m []float64, d []float64) []float64 {
-	psill := m[0]
-	rangeVal := m[1]
-	nugget := m[2]
-	// effective range = range * 4/7
-	effRange := rangeVal * 4.0 / 7.0
+// GaussianVariogramModel 高斯变异函数模型。
+// m = [psill, range, nugget], γ(d) = psill * (1 - exp(-d² / (range*4/7)²)) + nugget
+func GaussianVariogramModel(m, d []float64) []float64 {
+	psill, rng, nugget := m[0], m[1], m[2]
+	effRange := rng * 4.0 / 7.0
 	result := make([]float64, len(d))
 	for i, dist := range d {
 		result[i] = psill*(1.0-math.Exp(-(dist*dist)/(effRange*effRange))) + nugget
@@ -62,15 +57,11 @@ func GaussianVariogramModel(m []float64, d []float64) []float64 {
 	return result
 }
 
-// ExponentialVariogramModel implements the exponential variogram model.
-// m = [psill, range, nugget]
-// γ(d) = psill * (1 - exp(-d / (range/3))) + nugget
-func ExponentialVariogramModel(m []float64, d []float64) []float64 {
-	psill := m[0]
-	rangeVal := m[1]
-	nugget := m[2]
-	// effective range = range / 3
-	effRange := rangeVal / 3.0
+// ExponentialVariogramModel 指数变异函数模型。
+// m = [psill, range, nugget], γ(d) = psill * (1 - exp(-d / (range/3))) + nugget
+func ExponentialVariogramModel(m, d []float64) []float64 {
+	psill, rng, nugget := m[0], m[1], m[2]
+	effRange := rng / 3.0
 	result := make([]float64, len(d))
 	for i, dist := range d {
 		result[i] = psill*(1.0-math.Exp(-dist/effRange)) + nugget
@@ -78,18 +69,16 @@ func ExponentialVariogramModel(m []float64, d []float64) []float64 {
 	return result
 }
 
-// SphericalVariogramModel implements the spherical variogram model.
+// SphericalVariogramModel 球状变异函数模型。
 // m = [psill, range, nugget]
-// γ(d) = psill * (1.5*d/range - 0.5*(d/range)³) + nugget  for d <= range
-// γ(d) = psill + nugget                                    for d > range
-func SphericalVariogramModel(m []float64, d []float64) []float64 {
-	psill := m[0]
-	rangeVal := m[1]
-	nugget := m[2]
+// γ(d) = psill * (1.5*d/range - 0.5*(d/range)³) + nugget  (d ≤ range)
+// γ(d) = psill + nugget                                    (d > range)
+func SphericalVariogramModel(m, d []float64) []float64 {
+	psill, rng, nugget := m[0], m[1], m[2]
 	result := make([]float64, len(d))
 	for i, dist := range d {
-		if dist <= rangeVal {
-			ratio := dist / rangeVal
+		if dist <= rng {
+			ratio := dist / rng
 			result[i] = psill*(1.5*ratio-0.5*ratio*ratio*ratio) + nugget
 		} else {
 			result[i] = psill + nugget
@@ -98,14 +87,11 @@ func SphericalVariogramModel(m []float64, d []float64) []float64 {
 	return result
 }
 
-// HoleEffectVariogramModel implements the hole-effect variogram model.
-// m = [psill, range, nugget]
-// γ(d) = psill * (1 - (1 - d/(range/3)) * exp(-d/(range/3))) + nugget
-func HoleEffectVariogramModel(m []float64, d []float64) []float64 {
-	psill := m[0]
-	rangeVal := m[1]
-	nugget := m[2]
-	effRange := rangeVal / 3.0
+// HoleEffectVariogramModel 孔洞效应变异函数模型。
+// m = [psill, range, nugget], γ(d) = psill * (1 - (1 - d/(range/3)) * exp(-d/(range/3))) + nugget
+func HoleEffectVariogramModel(m, d []float64) []float64 {
+	psill, rng, nugget := m[0], m[1], m[2]
+	effRange := rng / 3.0
 	result := make([]float64, len(d))
 	for i, dist := range d {
 		result[i] = psill*(1.0-(1.0-dist/effRange)*math.Exp(-dist/effRange)) + nugget
@@ -113,12 +99,17 @@ func HoleEffectVariogramModel(m []float64, d []float64) []float64 {
 	return result
 }
 
-// VariogramModelMap maps variogram model names to their implementations.
-var VariogramModelMap = map[string]VariogramFunc{
+// variogramModels 变异函数模型名称到实现的映射。
+var variogramModels = map[string]VariogramFunc{
 	"linear":      LinearVariogramModel,
 	"power":       PowerVariogramModel,
 	"gaussian":    GaussianVariogramModel,
 	"spherical":   SphericalVariogramModel,
 	"exponential": ExponentialVariogramModel,
 	"hole-effect": HoleEffectVariogramModel,
+}
+
+// LookupVariogramModel 根据名称查找变异函数模型实现，未找到返回 nil。
+func LookupVariogramModel(name string) VariogramFunc {
+	return variogramModels[name]
 }

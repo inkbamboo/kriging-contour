@@ -27,6 +27,7 @@ import (
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/geojson"
 	"github.com/paulmach/orb/planar"
+	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/font"
 	"gonum.org/v1/plot/plotter"
@@ -34,6 +35,28 @@ import (
 	"gonum.org/v1/plot/vg/draw"
 	"gonum.org/v1/plot/vg/vgimg"
 )
+
+// defaultLogger 包级默认日志记录器，可通过 SetLogger 替换。
+var defaultLogger = utils.NewStepLogger(os.Stdout)
+
+// SetLogger 设置全局日志记录器的输出目标。设为 nil 则抑制所有日志。
+func SetLogger(writer *os.File) {
+	if writer == nil {
+		defaultLogger.SetLevel(utils.LogLevelError + 1) // 抑制所有级别
+	} else {
+		defaultLogger = utils.NewStepLogger(writer)
+	}
+}
+
+// SetLogLevel 设置全局日志级别。
+func SetLogLevel(level utils.LogLevel) {
+	defaultLogger.SetLevel(level)
+}
+
+// GetLogger 返回当前的日志记录器，供外部调用者获取执行摘要。
+func GetLogger() *utils.StepLogger {
+	return defaultLogger
+}
 
 // generateGrid 基于离散数据点和边界多边形，使用克里金插值（Ordinary Kriging）生成规则网格数据。
 //
@@ -49,14 +72,23 @@ import (
 // 插值结果会进行归一化缩放：若指定了 ContourStart/ContourEnd 则缩放到该范围，
 // 否则缩放到原始数据的值域范围。
 func generateGrid(points []*Point, boundary orb.Polygon, opt ContourOption) (grid *GridData, err error) {
+	end := defaultLogger.BeginStep("克里金网格插值")
+	defer func() {
+		end(err, nil)
+	}()
+
 	minLon, maxLon := boundary.Bound().Min[1], boundary.Bound().Max[1]
 	minLat, maxLat := boundary.Bound().Min[0], boundary.Bound().Max[0]
 	gridX, gridY := kriging.GenerateGrid(minLon, minLat, maxLon, maxLat, opt.Resolution)
 
+	defaultLogger.Debug("网格尺寸: %d × %d (lon: %.4f~%.4f, lat: %.4f~%.4f)",
+		len(gridX), len(gridY), minLon, maxLon, minLat, maxLat)
+
 	config := kriging.DefaultOKConfig()
 	config.CoordinatesType = "euclidean"
 	config.VariogramModel = "spherical"
-	config.Verbose = true
+	config.Verbose = false // 克里金内部日志关闭，用我们的统一日志
+
 	x := make([]float64, len(points))
 	y := make([]float64, len(points))
 	z := make([]float64, len(points))
@@ -65,45 +97,113 @@ func generateGrid(points []*Point, boundary orb.Polygon, opt ContourOption) (gri
 		y[i] = p.X
 		z[i] = p.Z
 	}
-	ok, err := kriging.NewOrdinaryKriging(x, y, z, config)
-	if err != nil {
-		fmt.Printf("Error creating kriging: %v\n", err)
-		return nil, err
+
+	// 捕获克里金构建过程中的 panic
+	var ok *kriging.OrdinaryKriging
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("克里金模型构建 panic: %v", r)
+				defaultLogger.Error("克里金模型构建 panic，将使用 fallback IDW 插值: %v", r)
+			}
+		}()
+		ok, err = kriging.NewOrdinaryKriging(x, y, z, config)
+	}()
+
+	if err != nil || ok == nil {
+		err = fmt.Errorf("克里金插值失败 (将使用 IDW fallback): %w", err)
+		defaultLogger.Warn("克里金插值失败，启用 IDW fallback 插值")
+
+		// fallback: 使用逆距离加权插值 (IDW)
+		grid = fallbackIDW(points, gridX, gridY)
+		if grid == nil {
+			return nil, fmt.Errorf("IDW fallback 插值也失败: 无法生成网格")
+		}
+		origMin, origMax := utils.MinMax(z...)
+		gridMin, gridMax := utils.MinMax(grid.Z.RawMatrix().Data...)
+		normalizeGrid(grid, gridMin, gridMax, origMin, origMax, opt)
+		return grid, nil
 	}
 
-	zvGrid, _ := ok.ExecuteGrid(gridX, gridY)
+	// 捕获 ExecuteGrid 过程中的 panic
+	var zvGrid *mat.Dense
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("克里金网格执行 panic: %v", r)
+				defaultLogger.Error("克里金网格执行 panic，将使用 fallback IDW 插值: %v", r)
+			}
+		}()
+		zvGrid, _ = ok.ExecuteGrid(gridX, gridY)
+	}()
+
+	if err != nil || zvGrid == nil {
+		err = fmt.Errorf("克里金网格执行失败 (将使用 IDW fallback): %w", err)
+		defaultLogger.Warn("克里金网格执行失败，启用 IDW fallback 插值")
+
+		grid = fallbackIDW(points, gridX, gridY)
+		if grid == nil {
+			return nil, fmt.Errorf("IDW fallback 插值也失败: 无法生成网格")
+		}
+		origMin, origMax := utils.MinMax(z...)
+		gridMin, gridMax := utils.MinMax(grid.Z.RawMatrix().Data...)
+		normalizeGrid(grid, gridMin, gridMax, origMin, origMax, opt)
+		return grid, nil
+	}
+
 	origMin, origMax := utils.MinMax(z...)
 	gridMin, gridMax := utils.MinMax(zvGrid.RawMatrix().Data...)
 
-	// 对克里金插值结果进行归一化缩放
-	rows, cols := zvGrid.Dims()
-	if gridMax-gridMin > 1e-10 {
-		if opt.ContourEnd-opt.ContourStart > 1e-10 {
-			// 如果指定了等值线范围，缩放到等值线范围
-			for i := 0; i < rows; i++ {
-				for j := 0; j < cols; j++ {
-					v := zvGrid.At(i, j)
-					v = opt.ContourStart + (v-gridMin)/(gridMax-gridMin)*(opt.ContourEnd-opt.ContourStart)
-					zvGrid.Set(i, j, v)
-				}
-			}
-		} else if origMax-origMin > 1e-10 {
-			// 否则缩放到原始数据范围
-			for i := 0; i < rows; i++ {
-				for j := 0; j < cols; j++ {
-					v := zvGrid.At(i, j)
-					v = origMin + (v-gridMin)/(gridMax-gridMin)*(origMax-origMin)
-					zvGrid.Set(i, j, v)
-				}
-			}
+	defaultLogger.Debug("Kriging 结果范围: [%.4f, %.4f], 原始范围: [%.4f, %.4f]",
+		gridMin, gridMax, origMin, origMax)
+
+	// 检查插值结果是否有效
+	if math.IsNaN(gridMin) || math.IsNaN(gridMax) || math.IsInf(gridMin, 0) || math.IsInf(gridMax, 0) {
+		defaultLogger.Warn("克里金插值结果包含 NaN/Inf，使用 IDW fallback")
+		grid = fallbackIDW(points, gridX, gridY)
+		if grid != nil {
+			gMin, gMax := utils.MinMax(grid.Z.RawMatrix().Data...)
+			normalizeGrid(grid, gMin, gMax, origMin, origMax, opt)
 		}
+		return grid, nil
 	}
 
-	return &GridData{
+	grid = &GridData{
 		Z: zvGrid,
 		X: gridX,
 		Y: gridY,
-	}, nil
+	}
+
+	normalizeGrid(grid, gridMin, gridMax, origMin, origMax, opt)
+	err = nil // 成功，清除 fallback 产生的错误
+	return grid, nil
+}
+
+// normalizeGrid 对克里金插值结果进行归一化缩放。
+func normalizeGrid(grid *GridData, gridMin, gridMax, origMin, origMax float64, opt ContourOption) {
+	rows, cols := grid.Z.Dims()
+	if gridMax-gridMin <= 1e-10 {
+		return
+	}
+	if opt.ContourEnd-opt.ContourStart > 1e-10 {
+		// 如果指定了等值线范围，缩放到等值线范围
+		for i := 0; i < rows; i++ {
+			for j := 0; j < cols; j++ {
+				v := grid.Z.At(i, j)
+				v = opt.ContourStart + (v-gridMin)/(gridMax-gridMin)*(opt.ContourEnd-opt.ContourStart)
+				grid.Z.Set(i, j, v)
+			}
+		}
+	} else if origMax-origMin > 1e-10 {
+		// 否则缩放到原始数据范围
+		for i := 0; i < rows; i++ {
+			for j := 0; j < cols; j++ {
+				v := grid.Z.At(i, j)
+				v = origMin + (v-gridMin)/(gridMax-gridMin)*(origMax-origMin)
+				grid.Z.Set(i, j, v)
+			}
+		}
+	}
 }
 
 // getContourLevels 根据 ContourOption 生成等值线级别（level）列表。
@@ -170,18 +270,62 @@ func extractCoords(p vg.Path, xMin, xMax, yMin, yMax, canvasSize float64) []orb.
 //	properties 含 level/is_closed/high_value_side 等字段。
 //	最后一项为边界多边形 feature（properties["type"] = "boundary"）。
 func GenerateLines(points []*Point, boundary orb.Polygon, opt ContourOption) []*geojson.Feature {
-	grid, err := generateGrid(points, boundary, opt)
+	// ========== 输入校验 ==========
+	stats := ComputeDataStats(points)
+	defaultLogger.Info("原始数据点: %d, 有效点: %d, X范围: [%.4f, %.4f], Y范围: [%.4f, %.4f], Z范围: [%.4f, %.4f], NaN: %d, Inf: %d, 重复: %d",
+		stats.OriginalCount, stats.CleanedCount,
+		stats.MinX, stats.MaxX, stats.MinY, stats.MaxY,
+		stats.MinZ, stats.MaxZ, stats.NanCount, stats.InfCount, stats.DupCount)
+
+	cleanPoints, warns, err := ValidatePoints(points, 3)
+	for _, w := range warns {
+		defaultLogger.Warn("数据校验警告: %s", w)
+	}
 	if err != nil {
+		defaultLogger.Error("数据校验失败: %v", err)
 		return nil
 	}
 
+	boundaryWarns, err := ValidateBoundary(boundary)
+	for _, w := range boundaryWarns {
+		defaultLogger.Warn("边界校验警告: %s", w)
+	}
+	if err != nil {
+		defaultLogger.Error("边界校验失败: %v", err)
+		return nil
+	}
+
+	optWarns, err := ValidateContourOption(opt)
+	for _, w := range optWarns {
+		defaultLogger.Warn("参数校验警告: %s", w)
+	}
+	if err != nil {
+		defaultLogger.Error("参数校验失败: %v", err)
+		return nil
+	}
+
+	// ========== 克里金插值 ==========
+	grid, err := generateGrid(cleanPoints, boundary, opt)
+	if err != nil {
+		defaultLogger.Error("网格生成失败: %v", err)
+		return nil
+	}
+
+	defaultLogger.Info("等值线级别数: %d", len(getContourLevels(grid, opt)))
+
+	// ========== 等值线提取 ==========
+	levelEnd := defaultLogger.BeginStep("等值线提取")
 	levels := getContourLevels(grid, opt)
 	if len(levels) == 0 {
+		defaultLogger.Warn("没有有效的等值线级别")
+		levelEnd(nil, map[string]interface{}{"warning": "无有效级别"})
 		return nil
 	}
 
 	rows, cols := grid.Z.Dims()
 	if rows < 2 || cols < 2 {
+		defaultLogger.Error("网格尺寸过小: %d × %d", rows, cols)
+		levelEnd(fmt.Errorf("网格尺寸过小"), nil)
 		return nil
 	}
 	cg := contour.NewGrid(grid.X, grid.Y, grid.Z, cols, rows)
@@ -209,15 +353,23 @@ func GenerateLines(points []*Point, boundary orb.Polygon, opt ContourOption) []*
 		_ = p.Invoke(level)
 	}
 	wg.Wait()
+
+	levelEnd(nil, map[string]interface{}{"features": len(features)})
+	defaultLogger.Info("等值线总数: %d", len(features))
+
 	boundaryFeature := geojson.NewFeature(closeBoundaryPolygon(boundary))
 	boundaryFeature.Properties = maputil.Merge(map[string]interface{}{"type": "boundary"}, opt.Extra)
 	features = append(features, boundaryFeature)
 
 	// 如果指定了图片路径，渲染所有等值线为一张 PNG 图片
 	if opt.ImagePath != "" {
+		imgEnd := defaultLogger.BeginStep("渲染等值线图片")
 		renderContourImage(cg, levels, opt.ImagePath)
+		imgEnd(nil, nil)
 	}
 
+	// 输出处理摘要
+	defaultLogger.Summary()
 	return features
 }
 
@@ -798,12 +950,12 @@ func renderContourImage(cg *contour.Grid, levels []float64, path string) {
 
 	f, err := os.Create(path)
 	if err != nil {
-		fmt.Printf("renderContourImage create error: %v\n", err)
+		defaultLogger.Error("renderContourImage 创建文件失败: %v", err)
 		return
 	}
 	defer f.Close()
 	if err := png.Encode(f, c.Image()); err != nil {
-		fmt.Printf("renderContourImage encode error: %v\n", err)
+		defaultLogger.Error("renderContourImage 编码图片失败: %v", err)
 		return
 	}
 }

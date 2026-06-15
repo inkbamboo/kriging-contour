@@ -6,14 +6,9 @@ import (
 	"github.com/inkbamboo/kriging-contour/internal/utils"
 )
 
-// GenerateGrid 根据边界多边形和分辨率创建规则插值网格的坐标轴
-// 参数:
-//   - boundary: 边界多边形
-//   - resolution: 网格分辨率（长边方向的网格数）
-//
-// 返回值:
-//   - []float64: X方向网格坐标列表
-//   - []float64: Y方向网格坐标列表
+// GenerateGrid 根据边界范围和分辨率创建规则插值网格的坐标轴。
+// 在边界外增加 2% 的 padding，长边方向分辨率 = resolution，
+// 短边方向按比例缩放，最小不低于 10。
 func GenerateGrid(minX, minY, maxX, maxY float64, resolution int) ([]float64, []float64) {
 	padX := (maxX - minX) * 0.02
 	padY := (maxY - minY) * 0.02
@@ -21,7 +16,9 @@ func GenerateGrid(minX, minY, maxX, maxY float64, resolution int) ([]float64, []
 	maxX += padX
 	minY -= padY
 	maxY += padY
+
 	dx, dy := maxX-minX, maxY-minY
+
 	var nx, ny int
 	if dx > dy {
 		nx = resolution
@@ -31,7 +28,5 @@ func GenerateGrid(minX, minY, maxX, maxY float64, resolution int) ([]float64, []
 		nx = int(math.Max(float64(resolution)*dx/dy, 10))
 	}
 
-	gridX := utils.MakeLinspace(minX, maxX, nx)
-	gridY := utils.MakeLinspace(minY, maxY, ny)
-	return gridX, gridY
+	return utils.MakeLinspace(minX, maxX, nx), utils.MakeLinspace(minY, maxY, ny)
 }

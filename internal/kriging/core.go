@@ -1,23 +1,22 @@
 package kriging
 
 import (
+	"errors"
+	"fmt"
 	"math"
 
 	"gonum.org/v1/gonum/mat"
 )
 
-const (
-	// Eps is the cutoff for comparison to zero.
-	Eps = 1.0e-10
-)
+// eps 浮点数比较容差。
+const eps = 1.0e-10
 
-// GreatCircleDistance calculates the great circle distance between points
-// given in spherical coordinates (degrees). Uses the arctan version for
-// increased numerical stability.
-// lon1, lat1, lon2, lat2 are all in degrees.
-// Returns distance in degrees.
+// ============================================================
+//  距离计算
+// ============================================================
+
+// GreatCircleDistance 使用 atan 版本计算球面坐标间的 Great Circle 距离（度数）。
 func GreatCircleDistance(lon1, lat1, lon2, lat2 float64) float64 {
-	// Convert to radians
 	lat1Rad := lat1 * math.Pi / 180.0
 	lat2Rad := lat2 * math.Pi / 180.0
 	dlon := (lon1 - lon2) * math.Pi / 180.0
@@ -34,10 +33,7 @@ func GreatCircleDistance(lon1, lat1, lon2, lat2 float64) float64 {
 	)
 }
 
-// GreatCircleDistanceVec computes the great circle distances between
-// a single point and multiple points.
-// lon1, lat1 are scalar coordinates (degrees).
-// lon2, lat2 are slices of coordinates (degrees).
+// GreatCircleDistanceVec 计算一点到多个点的 Great Circle 距离。
 func GreatCircleDistanceVec(lon1, lat1 float64, lon2, lat2 []float64) []float64 {
 	n := len(lon2)
 	result := make([]float64, n)
@@ -47,11 +43,9 @@ func GreatCircleDistanceVec(lon1, lat1 float64, lon2, lat2 []float64) []float64 
 	return result
 }
 
-// GreatCircleDistanceMat computes all pairwise great circle distances
-// between two sets of points.
+// GreatCircleDistanceMat 计算两组点之间的全对 Great Circle 距离。
 func GreatCircleDistanceMat(lon1, lat1, lon2, lat2 []float64) []float64 {
-	n1 := len(lon1)
-	n2 := len(lon2)
+	n1, n2 := len(lon1), len(lon2)
 	result := make([]float64, n1*n2)
 	for i := 0; i < n1; i++ {
 		for j := 0; j < n2; j++ {
@@ -61,84 +55,16 @@ func GreatCircleDistanceMat(lon1, lat1, lon2, lat2 []float64) []float64 {
 	return result
 }
 
-// AdjustForAnisotropy adjusts data coordinates to take into account anisotropy.
-// Angles are CCW about specified axes. Scaling is applied in the rotated
-// coordinate system.
-// X: [nSamples][nDim] coordinates
-// center: [nDim] center coordinates
-// scaling: [nDim-1] scaling factors
-// angle: [2*nDim-3] anisotropy angles in degrees
-func AdjustForAnisotropy(X [][]float64, center []float64, scaling []float64, angle []float64) [][]float64 {
-	nSamples := len(X)
-	if nSamples == 0 {
-		return X
-	}
-	nDim := len(X[0])
-
-	// Subtract center
-	XAdj := make([][]float64, nSamples)
-	for i := 0; i < nSamples; i++ {
-		XAdj[i] = make([]float64, nDim)
-		for j := 0; j < nDim; j++ {
-			XAdj[i][j] = X[i][j] - center[j]
-		}
-	}
-
-	if nDim == 2 {
-		// Convert angle to radians
-		theta := -angle[0] * math.Pi / 180.0
-		cosT := math.Cos(theta)
-		sinT := math.Sin(theta)
-
-		// Stretch matrix: [[1, 0], [0, scaling[0]]]
-		// Rotation matrix: [[cos(-θ), -sin(-θ)], [sin(-θ), cos(-θ)]]
-		// Combined: stretch * rotation
-		s := scaling[0]
-		for i := 0; i < nSamples; i++ {
-			// First rotate
-			x := XAdj[i][0]*cosT - XAdj[i][1]*sinT
-			y := XAdj[i][0]*sinT + XAdj[i][1]*cosT
-			// Then stretch in y
-			XAdj[i][0] = x
-			XAdj[i][1] = y * s
-		}
-	} else if nDim == 3 {
-		// 3D anisotropy not fully needed for OrdinaryKriging (2D only)
-		theta := -angle[0] * math.Pi / 180.0
-		cosT := math.Cos(theta)
-		sinT := math.Sin(theta)
-		s := scaling[0]
-
-		for i := 0; i < nSamples; i++ {
-			x := XAdj[i][0]*cosT - XAdj[i][1]*sinT
-			y := XAdj[i][0]*sinT + XAdj[i][1]*cosT
-			XAdj[i][0] = x
-			XAdj[i][1] = y * s
-		}
-	}
-
-	// Add back center
-	for i := 0; i < nSamples; i++ {
-		for j := 0; j < nDim; j++ {
-			XAdj[i][j] += center[j]
-		}
-	}
-
-	return XAdj
-}
-
-// EuclideanDistance computes the Euclidean distance between two points.
+// EuclideanDistance 计算两点间的欧氏距离。
 func EuclideanDistance(x1, y1, x2, y2 float64) float64 {
 	dx := x1 - x2
 	dy := y1 - y2
 	return math.Sqrt(dx*dx + dy*dy)
 }
 
-// PairwiseEuclideanDist computes all pairwise Euclidean distances between
-// a slice of points. Returns a condensed distance vector (upper triangle).
+// PairwiseEuclideanDist 计算点集内所有点对的欧氏距离（上三角压缩格式）。
 func PairwiseEuclideanDist(X, Y []float64) []float64 {
 	n := len(X)
-	// Number of pairwise combinations: n*(n-1)/2
 	nPairs := n * (n - 1) / 2
 	dist := make([]float64, nPairs)
 	idx := 0
@@ -153,8 +79,7 @@ func PairwiseEuclideanDist(X, Y []float64) []float64 {
 	return dist
 }
 
-// PairwiseSqEuclideanDist computes all pairwise squared Euclidean distances
-// between values z, used for semivariance computation.
+// PairwiseSqEuclideanDist 计算点集内所有点对的平方欧氏距离之半（用于半方差计算）。
 func PairwiseSqEuclideanDist(z []float64) []float64 {
 	n := len(z)
 	nPairs := n * (n - 1) / 2
@@ -170,11 +95,9 @@ func PairwiseSqEuclideanDist(z []float64) []float64 {
 	return sqDist
 }
 
-// CdistEuclidean computes Euclidean distances between each point in X1/Y1
-// and each point in X2/Y2. Returns a flat slice [len(X1)*len(X2)].
+// CdistEuclidean 计算两组点之间的全对欧氏距离，返回一维数组。
 func CdistEuclidean(X1, Y1, X2, Y2 []float64) []float64 {
-	n1 := len(X1)
-	n2 := len(X2)
+	n1, n2 := len(X1), len(X2)
 	dist := make([]float64, n1*n2)
 	for i := 0; i < n1; i++ {
 		for j := 0; j < n2; j++ {
@@ -186,107 +109,151 @@ func CdistEuclidean(X1, Y1, X2, Y2 []float64) []float64 {
 	return dist
 }
 
-// SqDistMat computes the square distance matrix from condensed form.
-func SqDistMat(dist []float64, n int) *mat.Dense {
-	m := mat.NewDense(n, n, nil)
-	idx := 0
-	for i := 0; i < n; i++ {
-		for j := i + 1; j < n; j++ {
-			m.Set(i, j, dist[idx])
-			m.Set(j, i, dist[idx])
-			idx++
+// ============================================================
+//  各向异性调整
+// ============================================================
+
+// AdjustForAnisotropy 根据各向异性参数调整数据坐标。
+// X: [nSamples][nDim] 坐标，center: 中心坐标，
+// scaling: 缩放因子，angle: 各向异性角度（度，CCW）。
+func AdjustForAnisotropy(X [][]float64, center, scaling, angle []float64) [][]float64 {
+	nSamples := len(X)
+	if nSamples == 0 {
+		return X
+	}
+	nDim := len(X[0])
+
+	XAdj := make([][]float64, nSamples)
+	for i := 0; i < nSamples; i++ {
+		XAdj[i] = make([]float64, nDim)
+		for j := 0; j < nDim; j++ {
+			XAdj[i][j] = X[i][j] - center[j]
 		}
 	}
-	return m
+
+	if nDim == 2 || nDim == 3 {
+		theta := -angle[0] * math.Pi / 180.0
+		cosT, sinT := math.Cos(theta), math.Sin(theta)
+		s := scaling[0]
+		for i := 0; i < nSamples; i++ {
+			x := XAdj[i][0]*cosT - XAdj[i][1]*sinT
+			y := XAdj[i][0]*sinT + XAdj[i][1]*cosT
+			XAdj[i][0] = x
+			XAdj[i][1] = y * s
+		}
+	}
+
+	for i := 0; i < nSamples; i++ {
+		for j := 0; j < nDim; j++ {
+			XAdj[i][j] += center[j]
+		}
+	}
+	return XAdj
 }
 
-// MakeVariogramParameterList converts user input for variogram model parameters
-// into the internal format expected by the code.
-// Returns nil if automatic estimation should be used.
-func MakeVariogramParameterList(variogramModel string, variogramParameters interface{}) []float64 {
-	if variogramParameters == nil {
-		return nil
+// ============================================================
+//  变异函数参数解析
+// ============================================================
+
+// variogramParamCount 返回指定变异函数模型的参数个数。
+func variogramParamCount(model string) int {
+	switch model {
+	case "linear":
+		return 2
+	case "power", "gaussian", "spherical", "exponential", "hole-effect":
+		return 3
+	default:
+		return 0
+	}
+}
+
+// MakeVariogramParameterList 将用户输入的变异函数参数转换为内部格式。
+// 若参数为 nil 则返回 nil（由后续自动拟合）。
+func MakeVariogramParameterList(model string, params interface{}) ([]float64, error) {
+	if params == nil {
+		return nil, nil
 	}
 
-	switch v := variogramParameters.(type) {
+	switch v := params.(type) {
 	case []float64:
-		switch variogramModel {
-		case "linear":
-			if len(v) != 2 {
-				panic("linear variogram model requires exactly 2 parameters")
-			}
-			return v
-		case "power":
-			if len(v) != 3 {
-				panic("power variogram model requires exactly 3 parameters")
-			}
-			return v
-		case "gaussian", "spherical", "exponential", "hole-effect":
-			if len(v) != 3 {
-				panic(variogramModel + " variogram model requires exactly 3 parameters")
-			}
-			// Convert [sill, range, nugget] to [psill, range, nugget]
-
-			return []float64{v[0] - v[2], v[1], v[2]}
-		case "custom":
-			return v
-		default:
-			panic("unsupported variogram model: " + variogramModel)
-		}
-
+		return parseListParams(model, v)
 	case map[string]float64:
-		switch variogramModel {
-		case "linear":
-			slope, ok1 := v["slope"]
-			nugget, ok2 := v["nugget"]
-			if !ok1 || !ok2 {
-				panic("linear variogram model requires 'slope' and 'nugget'")
-			}
-			return []float64{slope, nugget}
-		case "power":
-			scale, ok1 := v["scale"]
-			exponent, ok2 := v["exponent"]
-			nugget, ok3 := v["nugget"]
-			if !ok1 || !ok2 || !ok3 {
-				panic("power variogram model requires 'scale', 'exponent', and 'nugget'")
-			}
-			return []float64{scale, exponent, nugget}
-		case "gaussian", "spherical", "exponential", "hole-effect":
-			rangeVal, ok1 := v["range"]
-			nugget, ok2 := v["nugget"]
-			if !ok1 || !ok2 {
-				panic(variogramModel + " requires 'range' and 'nugget'")
-			}
-			if sill, ok := v["sill"]; ok {
-				return []float64{sill - nugget, rangeVal, nugget}
-			}
-			if psill, ok := v["psill"]; ok {
-				return []float64{psill, rangeVal, nugget}
-			}
-			panic(variogramModel + " requires either 'sill' or 'psill'")
-		default:
-			panic("unsupported variogram model: " + variogramModel)
+		return parseMapParams(model, v)
+	default:
+		return nil, fmt.Errorf("variogram parameters must be []float64 or map[string]float64, got %T", params)
+	}
+}
+
+func parseListParams(model string, v []float64) ([]float64, error) {
+	n := variogramParamCount(model)
+	if n == 0 {
+		return nil, fmt.Errorf("unsupported variogram model: %s", model)
+	}
+	if len(v) != n {
+		return nil, fmt.Errorf("%s variogram model requires exactly %d parameters, got %d", model, n, len(v))
+	}
+	switch model {
+	case "gaussian", "spherical", "exponential", "hole-effect":
+		// 用户传入 [sill, range, nugget] → 内部使用 [psill, range, nugget]
+		return []float64{v[0] - v[2], v[1], v[2]}, nil
+	default:
+		return v, nil
+	}
+}
+
+func parseMapParams(model string, v map[string]float64) ([]float64, error) {
+	switch model {
+	case "linear":
+		slope, ok1 := v["slope"]
+		nugget, ok2 := v["nugget"]
+		if !ok1 || !ok2 {
+			return nil, errors.New("linear variogram model requires 'slope' and 'nugget'")
 		}
+		return []float64{slope, nugget}, nil
+
+	case "power":
+		scale, ok1 := v["scale"]
+		exponent, ok2 := v["exponent"]
+		nugget, ok3 := v["nugget"]
+		if !ok1 || !ok2 || !ok3 {
+			return nil, errors.New("power variogram model requires 'scale', 'exponent', and 'nugget'")
+		}
+		return []float64{scale, exponent, nugget}, nil
+
+	case "gaussian", "spherical", "exponential", "hole-effect":
+		rng, ok1 := v["range"]
+		nugget, ok2 := v["nugget"]
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("%s variogram model requires 'range' and 'nugget'", model)
+		}
+		if sill, ok := v["sill"]; ok {
+			return []float64{sill - nugget, rng, nugget}, nil
+		}
+		if psill, ok := v["psill"]; ok {
+			return []float64{psill, rng, nugget}, nil
+		}
+		return nil, fmt.Errorf("%s variogram model requires either 'sill' or 'psill'", model)
 
 	default:
-		panic("variogram parameters must be []float64 or map[string]float64")
+		return nil, fmt.Errorf("unsupported variogram model: %s", model)
 	}
 }
 
-// computeExperimentalVariogram computes lags and semivariance from coordinate
-// and value data. This implements the binning approach from PyKrige.
+// ============================================================
+//  实验变异函数计算
+// ============================================================
+
+// ComputeExperimentalVariogram 从坐标和值数据计算实验变异函数（lags 和 semivariance）。
 func ComputeExperimentalVariogram(
-	X, Y, Z []float64,
-	nlags int,
-	coordinatesType string,
-) (lags []float64, semivariance []float64) {
+	X, Y, Z []float64, nlags int, coordType string,
+) (lags, semivariance []float64) {
 
 	var d, g []float64
 
-	if coordinatesType == "euclidean" {
+	if coordType == "euclidean" {
 		d = PairwiseEuclideanDist(X, Y)
 		g = PairwiseSqEuclideanDist(Z)
-	} else if coordinatesType == "geographic" {
+	} else {
 		n := len(X)
 		nPairs := n * (n - 1) / 2
 		d = make([]float64, nPairs)
@@ -302,9 +269,7 @@ func ComputeExperimentalVariogram(
 		}
 	}
 
-	// Find min and max distance
-	dmax := d[0]
-	dmin := d[0]
+	dmin, dmax := d[0], d[0]
 	for _, v := range d {
 		if v < dmin {
 			dmin = v
@@ -314,15 +279,14 @@ func ComputeExperimentalVariogram(
 		}
 	}
 
-	// Equal-sized bins
-	dd := (dmax - dmin) / float64(nlags)
+	// 等宽分箱
+	binWidth := (dmax - dmin) / float64(nlags)
 	bins := make([]float64, nlags+1)
 	for i := 0; i < nlags; i++ {
-		bins[i] = dmin + float64(i)*dd
+		bins[i] = dmin + float64(i)*binWidth
 	}
 	bins[nlags] = dmax + 0.001
 
-	// Compute binned lags and semivariance
 	rawLags := make([]float64, nlags)
 	rawSemi := make([]float64, nlags)
 	for i := 0; i < nlags; i++ {
@@ -344,173 +308,147 @@ func ComputeExperimentalVariogram(
 		}
 	}
 
-	// Remove NaN entries
 	for i := 0; i < nlags; i++ {
 		if !math.IsNaN(rawSemi[i]) {
 			lags = append(lags, rawLags[i])
 			semivariance = append(semivariance, rawSemi[i])
 		}
 	}
-
-	return lags, semivariance
+	return
 }
 
-// variogramResiduals computes residuals for variogram model fitting.
-func variogramResiduals(params []float64, lags, semivariance []float64,
-	variogramFunc VariogramFunc, weight bool) []float64 {
+// ============================================================
+//  变异函数模型拟合
+// ============================================================
 
-	predicted := variogramFunc(params, lags)
-	n := len(lags)
-	resid := make([]float64, n)
-
-	if weight {
-		// Compute range and logistic weights
-		xmin := lags[0]
-		xmax := lags[0]
-		for _, v := range lags {
-			if v < xmin {
-				xmin = v
-			}
-			if v > xmax {
-				xmax = v
-			}
-		}
-		drange := xmax - xmin
-		k := 2.1972 / (0.1 * drange)
-		x0 := 0.7*drange + xmin
-
-		var weightSum float64
-		weights := make([]float64, n)
-		for i := 0; i < n; i++ {
-			weights[i] = 1.0 / (1.0 + math.Exp(-k*(x0-lags[i])))
-			weightSum += weights[i]
-		}
-		for i := range weights {
-			weights[i] /= weightSum
-			resid[i] = (predicted[i] - semivariance[i]) * weights[i]
-		}
-	} else {
-		for i := range resid {
-			resid[i] = predicted[i] - semivariance[i]
-		}
-	}
-
-	return resid
-}
-
-// softL1 evaluates the soft L1 loss: 2 * (√(1+z) - 1) where z = r²
+// softL1 计算 soft L1 损失: 2 * (√(1+r²) - 1)
 func softL1(r float64) float64 {
 	return 2.0 * (math.Sqrt(1.0+r*r) - 1.0)
 }
 
-// FitVariogramModel fits variogram model parameters using soft-L1 optimization.
-//
-// This is a Go reimplementation of PyKrige's _calculate_variogram_model,
-// which uses scipy.optimize.least_squares(loss="soft_l1", bounds=...).
-//
-// Strategy:
-//  1. Grid-search over the bounded 3D parameter space to find an initial guess
-//     near the global optimum.
-//  2. Refine using a bounded Levenberg-Marquardt solver that directly leverages
-//     the least-squares problem structure (same as scipy's TRF method).
-//  3. Fall back to Nelder-Mead with restarts if LM fails.
-func FitVariogramModel(
-	lags, semivariance []float64,
-	variogramModel string,
-	variogramFunc VariogramFunc,
-	weight bool,
-) []float64 {
+// variogramResiduals 计算变异函数拟合残差。
+func variogramResiduals(params, lags, semivariance []float64, vfn VariogramFunc, weight bool) []float64 {
+	predicted := vfn(params, lags)
+	n := len(lags)
+	resid := make([]float64, n)
 
-	nParams := 2 // linear
-	if variogramModel == "power" {
-		nParams = 3
-	} else if variogramModel == "gaussian" || variogramModel == "spherical" ||
-		variogramModel == "exponential" || variogramModel == "hole-effect" {
-		nParams = 3
-	}
-
-	// Compute initial guess x0 and bounds (identical to PyKrige)
-	x0 := make([]float64, nParams)
-	lower := make([]float64, nParams)
-	upper := make([]float64, nParams)
-
-	setupBounds := func() (semivMax, semivMin, lagsMax, lagsMin float64) {
-		semivMax = semivariance[0]
-		semivMin = semivariance[0]
-		lagsMax = lags[0]
-		lagsMin = lags[0]
-		for i := range semivariance {
-			if semivariance[i] > semivMax {
-				semivMax = semivariance[i]
-			}
-			if semivariance[i] < semivMin {
-				semivMin = semivariance[i]
-			}
-			if lags[i] > lagsMax {
-				lagsMax = lags[i]
-			}
-			if lags[i] < lagsMin {
-				lagsMin = lags[i]
-			}
+	if !weight {
+		for i := range resid {
+			resid[i] = predicted[i] - semivariance[i]
 		}
-		return
+		return resid
 	}
 
-	boxed := func(i int) bool { return !math.IsInf(upper[i], 1) }
-
-	if variogramModel == "linear" {
-		semivMax, semivMin, lagsMax, lagsMin := setupBounds()
-		x0[0] = (semivMax - semivMin) / (lagsMax - lagsMin)
-		x0[1] = semivMin
-		lower[0], lower[1] = 0.0, 0.0
-		upper[0], upper[1] = math.Inf(1), semivMax
-	} else if variogramModel == "power" {
-		semivMax, semivMin, _, _ := setupBounds()
-		x0[0] = (semivMax - semivMin) / (lags[len(lags)-1] - lags[0])
-		x0[1] = 1.1
-		x0[2] = semivMin
-		lower[0], lower[1], lower[2] = 0.0, 0.001, 0.0
-		upper[0], upper[1], upper[2] = math.Inf(1), 1.999, semivMax
-	} else {
-		semivMax, semivMin, lagsMax, _ := setupBounds()
-		x0[0] = semivMax - semivMin
-		x0[1] = 0.25 * lagsMax
-		x0[2] = semivMin
-		lower[0], lower[1], lower[2] = 0.0, 0.0, 0.0
-		upper[0], upper[1], upper[2] = 10.0*semivMax, lagsMax, semivMax
+	// 加权：对近距 lag 赋予更高权重（logistic 权重）
+	xmin, xmax := lags[0], lags[0]
+	for _, v := range lags {
+		if v < xmin {
+			xmin = v
+		} else if v > xmax {
+			xmax = v
+		}
 	}
+	dRange := xmax - xmin
+	k := 2.1972 / (0.1 * dRange)
+	x0 := 0.7*dRange + xmin
+
+	weights := make([]float64, n)
+	var weightSum float64
+	for i := 0; i < n; i++ {
+		weights[i] = 1.0 / (1.0 + math.Exp(-k*(x0-lags[i])))
+		weightSum += weights[i]
+	}
+	for i := range weights {
+		weights[i] /= weightSum
+		resid[i] = (predicted[i] - semivariance[i]) * weights[i]
+	}
+	return resid
+}
+
+// paramBounds 描述优化参数的范围及关联的数据统计量。
+type paramBounds struct {
+	lower, upper, x0 []float64
+	semivMax         float64 // 实验变异函数最大值
+	semivMin         float64 // 实验变异函数最小值
+	lagsMax          float64 // 最大 lag
+	lagsMin          float64 // 最小 lag
+}
+
+// setupParamBounds 根据变异函数模型和数据计算初始值和边界。
+func setupParamBounds(model string, lags, semivariance []float64) paramBounds {
+	nParams := variogramParamCount(model)
+	b := paramBounds{
+		lower: make([]float64, nParams),
+		upper: make([]float64, nParams),
+		x0:    make([]float64, nParams),
+	}
+
+	b.semivMax, b.semivMin = semivariance[0], semivariance[0]
+	b.lagsMax, b.lagsMin = lags[0], lags[0]
+	for i := range semivariance {
+		if semivariance[i] > b.semivMax {
+			b.semivMax = semivariance[i]
+		}
+		if semivariance[i] < b.semivMin {
+			b.semivMin = semivariance[i]
+		}
+		if lags[i] > b.lagsMax {
+			b.lagsMax = lags[i]
+		}
+		if lags[i] < b.lagsMin {
+			b.lagsMin = lags[i]
+		}
+	}
+
+	switch {
+	case model == "linear":
+		b.x0[0] = (b.semivMax - b.semivMin) / (b.lagsMax - b.lagsMin)
+		b.x0[1] = b.semivMin
+		b.lower[0], b.lower[1] = 0.0, 0.0
+		b.upper[0], b.upper[1] = math.Inf(1), b.semivMax
+
+	case model == "power":
+		b.x0[0] = (b.semivMax - b.semivMin) / (b.lagsMax - b.lagsMin)
+		b.x0[1] = 1.1
+		b.x0[2] = b.semivMin
+		b.lower[0], b.lower[1], b.lower[2] = 0.0, 0.001, 0.0
+		b.upper[0], b.upper[1], b.upper[2] = math.Inf(1), 1.999, b.semivMax
+
+	default: // gaussian, spherical, exponential, hole-effect
+		b.x0[0] = b.semivMax - b.semivMin
+		b.x0[1] = 0.25 * b.lagsMax
+		b.x0[2] = b.semivMin
+		b.lower[0], b.lower[1], b.lower[2] = 0.0, 0.0, 0.0
+		b.upper[0], b.upper[1], b.upper[2] = 10.0*b.semivMax, b.lagsMax, b.semivMax
+	}
+
+	return b
+}
+
+// FitVariogramModel 使用 soft-L1 优化的 golden-section 坐标下降法拟合变异函数模型参数。
+//
+// 策略：
+//  1. 多起始点搜索以避免局部最优
+//  2. 对每个起始点进行坐标下降（2D: 单参数, 3D: 交替正反向）
+//  3. 3参数模型：后处理 near-nugget range 修正（对齐 scipy TRF 行为）
+func FitVariogramModel(lags, semivariance []float64, model string, vfn VariogramFunc, weight bool) []float64 {
+	nParams := variogramParamCount(model)
+	bounds := setupParamBounds(model, lags, semivariance)
 
 	clamp := func(x []float64) {
 		for i := range x {
-			if x[i] < lower[i] {
-				x[i] = lower[i]
+			if x[i] < bounds.lower[i] {
+				x[i] = bounds.lower[i]
 			}
-			if boxed(i) && x[i] > upper[i] {
-				if math.IsInf(upper[i], 1) {
-					continue
-				}
-				x[i] = upper[i]
+			if !math.IsInf(bounds.upper[i], 1) && x[i] > bounds.upper[i] {
+				x[i] = bounds.upper[i]
 			}
 		}
 	}
-	clamp(x0)
-
-	// ---- Residual & objective functions ----
-
-	// ---- Coordinate Descent with Golden-Section Search ----
-	//
-	// Each parameter is optimized independently via golden-section line search
-	// while others are held fixed. Multiple cycles and shuffled parameter order
-	// help escape local minima in flat regions.
-	//
-	// For 3-param models, a post-optimization range sweep picks the range that
-	// minimizes the objective, matching scipy's TRF trajectory which monotonically
-	// reduces range from its initial value.
-	//
-	phi := (math.Sqrt(5.0) - 1.0) / 2.0 // golden ratio conjugate ≈ 0.382
+	clamp(bounds.x0)
 
 	objective := func(x []float64) float64 {
-		r := variogramResiduals(x, lags, semivariance, variogramFunc, weight)
+		r := variogramResiduals(x, lags, semivariance, vfn, weight)
 		var sum float64
 		for _, ri := range r {
 			sum += softL1(ri)
@@ -518,16 +456,17 @@ func FitVariogramModel(
 		return sum
 	}
 
+	// golden-section 线搜索
+	const phi = 0.6180339887498949 // 黄金比 φ = (√5-1)/2
+
 	goldenSection := func(base []float64, j int, lj, uj float64) float64 {
 		a, b := lj, uj
 		if b-a < 1e-8 {
-			return (a + b) / 2.0
+			return (a + b) / 2
 		}
 		invPhi := 1.0 - phi
 
-		x1 := a + invPhi*(b-a)
-		x2 := a + phi*(b-a)
-
+		x1, x2 := a+invPhi*(b-a), a+phi*(b-a)
 		p := make([]float64, nParams)
 		copy(p, base)
 		p[j] = x1
@@ -552,24 +491,23 @@ func FitVariogramModel(
 				f2 = objective(p)
 			}
 		}
-		return (a + b) / 2.0
+		return (a + b) / 2
 	}
 
-	// Multiple starting points to cover parameter space
-	starts := [][]float64{x0}
+	// 多起始点（3参数模型使用数据统计量生成多样化初值）
+	starts := [][]float64{bounds.x0}
 	if nParams == 3 {
-		svMax, semivMin, lagsMax, _ := setupBounds()
-		psillUB := upper[0]
+		psillUB := bounds.upper[0]
 		if math.IsInf(psillUB, 1) {
-			psillUB = 10.0 * (svMax - semivMin)
+			psillUB = 10.0 * (bounds.semivMax - bounds.semivMin)
 		}
-		rngUB := upper[1]
+		rngUB := bounds.upper[1]
 		if math.IsInf(rngUB, 1) {
-			rngUB = lagsMax
+			rngUB = bounds.lagsMax
 		}
-		nugUB := upper[2]
+		nugUB := bounds.upper[2]
 		if math.IsInf(nugUB, 1) {
-			nugUB = svMax
+			nugUB = bounds.semivMax
 		}
 		starts = append(starts,
 			[]float64{psillUB * 0.3, rngUB * 0.15, nugUB * 0.6},
@@ -581,7 +519,7 @@ func FitVariogramModel(
 
 	bestCost := math.Inf(1)
 	bestResult := make([]float64, nParams)
-	copy(bestResult, x0)
+	copy(bestResult, bounds.x0)
 
 	for _, start := range starts {
 		x := make([]float64, nParams)
@@ -591,23 +529,19 @@ func FitVariogramModel(
 		for cycle := 0; cycle < 15; cycle++ {
 			prevCost := objective(x)
 
-			// Shuffle parameter order every other cycle to reduce bias
-			forward := []int{0, 1, 2}
-			reverse := []int{2, 1, 0}
 			var order []int
 			if nParams == 2 {
 				order = []int{0, 1}
 			} else if cycle%2 == 0 {
-				order = forward
+				order = []int{0, 1, 2}
 			} else {
-				order = reverse
+				order = []int{2, 1, 0}
 			}
 
 			for _, j := range order {
-				lj := lower[j]
-				uj := upper[j]
-				if !boxed(j) {
-					uj = 10.0 * (x0[0] + x0[nParams-1])
+				lj, uj := bounds.lower[j], bounds.upper[j]
+				if math.IsInf(uj, 1) {
+					uj = 10.0 * (bounds.x0[0] + bounds.x0[nParams-1])
 				}
 				if uj <= lj || uj-lj < 1e-8 {
 					continue
@@ -622,34 +556,19 @@ func FitVariogramModel(
 		}
 		clamp(x)
 
-		cost := objective(x)
-		if cost < bestCost {
+		if cost := objective(x); cost < bestCost {
 			bestCost = cost
 			copy(bestResult, x)
 		}
 	}
 
-	// ---- Post-optimization: near-nugget range correction ----
-	//
-	// When the experimental variogram shows no spatial structure
-	// (semivariance flat or declining with distance), the model
-	// degenerates to pure nugget: all experimental lags lie beyond
-	// the fitted range, so the objective is flat w.r.t. range.
-	// scipy's TRF converges to range ≈ 0.75 * first_lag in this
-	// regime. We apply the same correction for consistency.
+	// near-nugget range 修正（对齐 scipy TRF 行为）
 	if nParams == 3 && len(lags) > 1 && bestResult[1] > 0 {
 		firstLag := lags[0]
-		// Check: is the model essentially pure nugget at the lags?
-		// (range at or near the first experimental lag)
-		nearFirstLag := math.Abs(bestResult[1]-firstLag)/firstLag < 0.05
-
-		if nearFirstLag {
-			// scipy TRF reduces range from x0=0.25*lagsMax until
-			// all lags > range, typically landing near 0.75*firstLag.
-			// Preserve the optimal sill (psill+nugget), only correct range.
-			correctedR := firstLag * 0.75
-			if correctedR >= lower[1] && correctedR < bestResult[1] {
-				bestResult[1] = correctedR
+		if math.Abs(bestResult[1]-firstLag)/firstLag < 0.05 {
+			corrected := firstLag * 0.75
+			if corrected >= bounds.lower[1] && corrected < bestResult[1] {
+				bestResult[1] = corrected
 			}
 		}
 	}
@@ -658,170 +577,156 @@ func FitVariogramModel(
 	return bestResult
 }
 
-// InitializeVariogramModel initializes the variogram model for kriging.
-// If parameters are not specified by the user, fits them automatically.
+// ============================================================
+//  变异函数初始化
+// ============================================================
+
+// InitializeVariogramModel 初始化变异函数模型。
+// 若用户未指定参数，自动拟合；否则验证并使用用户提供的参数。
 func InitializeVariogramModel(
 	X, Y, Z []float64,
-	variogramModel string,
-	variogramModelParams []float64,
-	variogramFunc VariogramFunc,
+	model string,
+	modelParams []float64,
+	vfn VariogramFunc,
 	nlags int,
 	weight bool,
-	coordinatesType string,
-) (lags []float64, semivariance []float64, params []float64) {
-	lags, semivariance = ComputeExperimentalVariogram(X, Y, Z, nlags, coordinatesType)
-	if variogramModelParams != nil {
-		// Validate parameters
-		if variogramModel == "linear" && len(variogramModelParams) != 2 {
-			panic("linear variogram model requires exactly 2 parameters")
-		}
-		if (variogramModel == "power" || variogramModel == "gaussian" ||
-			variogramModel == "spherical" || variogramModel == "exponential" ||
-			variogramModel == "hole-effect") && len(variogramModelParams) != 3 {
-			panic(variogramModel + " variogram model requires exactly 3 parameters")
-		}
+	coordType string,
+) (lags, semivariance, params []float64, err error) {
+	lags, semivariance = ComputeExperimentalVariogram(X, Y, Z, nlags, coordType)
 
-		params = variogramModelParams
+	if modelParams != nil {
+		n := variogramParamCount(model)
+		if n > 0 && len(modelParams) != n {
+			return nil, nil, nil, fmt.Errorf("%s variogram model requires exactly %d parameters, got %d", model, n, len(modelParams))
+		}
+		params = modelParams
 	} else {
-		if variogramModel == "custom" {
-			panic("must specify parameters for custom variogram model")
+		if model == "custom" {
+			return nil, nil, nil, errors.New("must specify parameters for custom variogram model")
 		}
-		params = FitVariogramModel(lags, semivariance, variogramModel, variogramFunc, weight)
+		params = FitVariogramModel(lags, semivariance, model, vfn, weight)
 	}
-
-	return lags, semivariance, params
+	return
 }
 
-// Krige solves the ordinary kriging system for a single coordinate pair.
-// Returns the kriging estimate and the kriging variance.
+// ============================================================
+//  克里金矩阵求解
+// ============================================================
+
+// Krige 对单个目标点求解普通克里金系统，返回估计值和方差。
 func Krige(
 	X, Y, Z []float64,
 	coordsX, coordsY float64,
-	variogramFunc VariogramFunc,
-	variogramParams []float64,
-	coordinatesType string,
+	vfn VariogramFunc,
+	vfnParams []float64,
+	coordType string,
 	pseudoInv bool,
-) (float64, float64) {
+) (zinterp, sigmasq float64) {
 
 	n := len(X)
 	nPlus1 := n + 1
 
-	var dMat [][]float64
-	var bd []float64
+	// 构建距离矩阵和 RHS
+	dMat, bd := buildKrigingDistance(X, Y, coordsX, coordsY, coordType, n)
 
-	if coordinatesType == "euclidean" {
-		// Compute distance matrix (square form)
-		dMat = make([][]float64, n)
-		for i := 0; i < n; i++ {
-			dMat[i] = make([]float64, n)
-			for j := 0; j < n; j++ {
-				dMat[i][j] = EuclideanDistance(X[i], Y[i], X[j], Y[j])
-			}
-		}
-		// Compute distances to target point
-		bd = make([]float64, n)
-		for i := 0; i < n; i++ {
-			bd[i] = EuclideanDistance(X[i], Y[i], coordsX, coordsY)
-		}
-	} else if coordinatesType == "geographic" {
-		// Compute great circle distance matrix
-		dMat = make([][]float64, n)
-		for i := 0; i < n; i++ {
-			dMat[i] = make([]float64, n)
-			for j := 0; j < n; j++ {
-				dMat[i][j] = GreatCircleDistance(X[i], Y[i], X[j], Y[j])
-			}
-		}
-		bd = GreatCircleDistanceVec(coordsX, coordsY, X, Y)
-	}
-
-	// Check if target overlaps with any measurement point
+	// 检查目标点是否与已知数据点重合
 	zeroIndex := -1
 	for i, d := range bd {
-		if math.Abs(d) <= Eps {
+		if math.Abs(d) <= eps {
 			zeroIndex = i
 			break
 		}
 	}
 
-	// Set up kriging matrix A: (n+1) x (n+1)
+	// 构建克里金矩阵 A (n+1)×(n+1)
 	aData := make([]float64, nPlus1*nPlus1)
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
-			row := dMat[i]
-			dFlattened := make([]float64, 1)
-			dFlattened[0] = row[j]
-			aData[i*nPlus1+j] = -variogramFunc(variogramParams, dFlattened)[0]
+			aData[i*nPlus1+j] = -variogramValue(vfn, vfnParams, dMat[i][j])
 		}
 	}
-	// Set diagonal to 0
 	for i := 0; i < n; i++ {
-		aData[i*nPlus1+i] = 0.0
+		aData[i*nPlus1+i] = 0.0 // 对角线
+		aData[n*nPlus1+i] = 1.0 // Lagrange 乘数约束
+		aData[i*nPlus1+n] = 1.0
 	}
-	// Lagrange multiplier constraints
-	for i := 0; i < n; i++ {
-		aData[n*nPlus1+i] = 1.0 // last row
-		aData[i*nPlus1+n] = 1.0 // last column
-	}
-	aData[n*nPlus1+n] = 0.0
 
-	// Set up RHS b: (n+1) x 1
+	// RHS 向量 b
 	bData := make([]float64, nPlus1)
 	for i := 0; i < n; i++ {
-		dFlattened := make([]float64, 1)
-		dFlattened[0] = bd[i]
-		bData[i] = -variogramFunc(variogramParams, dFlattened)[0]
+		bData[i] = -variogramValue(vfn, vfnParams, bd[i])
 	}
 	if zeroIndex >= 0 {
 		bData[zeroIndex] = 0.0
 	}
 	bData[n] = 1.0
 
-	// Solve A * x = b
+	// 求解 A * x = b
 	aMat := mat.NewDense(nPlus1, nPlus1, aData)
 	bVec := mat.NewVecDense(nPlus1, bData)
 
 	var xVec mat.VecDense
-	err := xVec.SolveVec(aMat, bVec)
-	if err != nil {
-		// Fallback: compute inverse and multiply
+	if err := xVec.SolveVec(aMat, bVec); err != nil {
+		// fallback: 先求逆再乘
 		var aInv mat.Dense
-		errInv := aInv.Inverse(aMat)
-		if errInv != nil {
-			// Last resort: use identity weights
+		if errInv := aInv.Inverse(aMat); errInv != nil {
+			// 最终回退：等权平均
 			var sumZ, sumW float64
 			for i := 0; i < n; i++ {
-				w := 1.0
-				sumZ += w * Z[i]
-				sumW += w
+				sumZ += Z[i]
+				sumW += 1.0
 			}
 			return sumZ / sumW, 0.0
 		}
 		xVec.MulVec(&aInv, bVec)
 	}
 
-	// Compute kriging estimate
-	var zinterp float64
 	for i := 0; i < n; i++ {
 		zinterp += xVec.AtVec(i) * Z[i]
 	}
-
-	// Compute kriging variance
-	var sigmasq float64
 	for i := 0; i < nPlus1; i++ {
 		sigmasq += xVec.AtVec(i) * (-bData[i])
 	}
-
-	return zinterp, sigmasq
+	return
 }
 
-// FindStatistics calculates variogram fit statistics.
-// Returns delta, sigma, epsilon arrays.
+// buildKrigingDistance 构建克里金求解所需的距离矩阵和对目标点的距离向量。
+func buildKrigingDistance(X, Y []float64, tx, ty float64, coordType string, n int) ([][]float64, []float64) {
+	dMat := make([][]float64, n)
+	bd := make([]float64, n)
+
+	switch coordType {
+	case "euclidean":
+		for i := 0; i < n; i++ {
+			dMat[i] = make([]float64, n)
+			for j := 0; j < n; j++ {
+				dMat[i][j] = EuclideanDistance(X[i], Y[i], X[j], Y[j])
+			}
+			bd[i] = EuclideanDistance(X[i], Y[i], tx, ty)
+		}
+	default: // geographic
+		for i := 0; i < n; i++ {
+			dMat[i] = make([]float64, n)
+			for j := 0; j < n; j++ {
+				dMat[i][j] = GreatCircleDistance(X[i], Y[i], X[j], Y[j])
+			}
+		}
+		bd = GreatCircleDistanceVec(tx, ty, X, Y)
+	}
+
+	return dMat, bd
+}
+
+// ============================================================
+//  拟合统计
+// ============================================================
+
+// FindStatistics 计算变异函数拟合的交叉验证统计量（delta, sigma, epsilon）。
 func FindStatistics(
 	X, Y, Z []float64,
-	variogramFunc VariogramFunc,
-	variogramParams []float64,
-	coordinatesType string,
+	vfn VariogramFunc,
+	vfnParams []float64,
+	coordType string,
 	pseudoInv bool,
 ) (delta, sigma, epsilon []float64) {
 
@@ -833,10 +738,10 @@ func FindStatistics(
 		k, ss := Krige(
 			X[:i], Y[:i], Z[:i],
 			X[i], Y[i],
-			variogramFunc, variogramParams,
-			coordinatesType, pseudoInv,
+			vfn, vfnParams,
+			coordType, pseudoInv,
 		)
-		if math.Abs(ss) < Eps {
+		if math.Abs(ss) < eps {
 			continue
 		}
 		allDelta[i] = Z[i] - k
@@ -844,7 +749,7 @@ func FindStatistics(
 	}
 
 	for i := 0; i < n; i++ {
-		if allSigma[i] > Eps {
+		if allSigma[i] > eps {
 			delta = append(delta, allDelta[i])
 			sigma = append(sigma, allSigma[i])
 		}
@@ -853,12 +758,14 @@ func FindStatistics(
 	for i := range sigma {
 		epsilon = append(epsilon, delta[i]/sigma[i])
 	}
-
-	return delta, sigma, epsilon
+	return
 }
 
-// CalcQ1 returns the Q1 statistic for the variogram fit.
+// CalcQ1 返回拟合质量统计量 Q1。
 func CalcQ1(epsilon []float64) float64 {
+	if len(epsilon) <= 1 {
+		return 0
+	}
 	var sum float64
 	for _, e := range epsilon {
 		sum += e
@@ -866,8 +773,11 @@ func CalcQ1(epsilon []float64) float64 {
 	return math.Abs(sum) / float64(len(epsilon)-1)
 }
 
-// CalcQ2 returns the Q2 statistic for the variogram fit.
+// CalcQ2 返回拟合质量统计量 Q2。
 func CalcQ2(epsilon []float64) float64 {
+	if len(epsilon) <= 1 {
+		return 0
+	}
 	var sum float64
 	for _, e := range epsilon {
 		sum += e * e
@@ -875,8 +785,11 @@ func CalcQ2(epsilon []float64) float64 {
 	return sum / float64(len(epsilon)-1)
 }
 
-// CalcCR returns the cR statistic for the variogram fit.
+// CalcCR 返回拟合质量统计量 cR。
 func CalcCR(Q2 float64, sigma []float64) float64 {
+	if len(sigma) == 0 {
+		return 0
+	}
 	var sumLog float64
 	for _, s := range sigma {
 		sumLog += math.Log(s * s)

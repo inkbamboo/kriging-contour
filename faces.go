@@ -56,53 +56,94 @@ type intersectionPt struct {
 //
 // 返回: 等值面 GeoJSON Feature 列表，properties 含 type / level 字段
 func GenerateFaces(features []*geojson.Feature, boundary orb.Polygon, opt ContourOption) []*geojson.Feature {
+	end := defaultLogger.BeginStep("等值面生成")
+	defer func() { end(nil, nil) }()
+
 	if len(features) == 0 {
+		defaultLogger.Warn("等值线 features 为空，无法生成等值面")
 		return nil
 	}
+
+	// 过滤掉 boundary feature
+	var contourFeatures []*geojson.Feature
+	for _, f := range features {
+		if f.Properties["type"] == "boundary" {
+			continue
+		}
+		contourFeatures = append(contourFeatures, f)
+	}
+	defaultLogger.Info("等值线特征数: %d (不含边界)", len(contourFeatures))
 
 	boundaryPoly := closeBoundaryPolygon(boundary)
 
 	// 1. 解析等值线为切割条目
-	entries := parseContourEntries(features)
+	entries := parseContourEntries(contourFeatures)
 	if len(entries) == 0 {
+		defaultLogger.Warn("解析等值线条目为空，无法生成等值面")
 		return nil
 	}
 
 	// 2. 分割边界多边形
 	rawPolys := splitPolys(boundaryPoly, entries)
-	fmt.Printf("  分割后碎片数: %d\n", len(rawPolys))
+	defaultLogger.Info("分割后碎片数: %d", len(rawPolys))
+	if len(rawPolys) == 0 {
+		defaultLogger.Warn("分割后无碎片，返回空等值面")
+		return nil
+	}
+
+	// 检查异常碎片：面积过小的碎片
+	{
+		smallPolyCount := 0
+		for _, poly := range rawPolys {
+			if planar.Area(poly) < 0.5 {
+				smallPolyCount++
+			}
+		}
+		if smallPolyCount > 0 {
+			defaultLogger.Debug("发现 %d 个异常小碎片", smallPolyCount)
+		}
+	}
 
 	// 3. 多边形去重（仅比较形状）
 	dedupRaw := deduplicatePolygons(rawPolys)
-
-	fmt.Printf("  去重后面数: %d\n", len(dedupRaw))
+	defaultLogger.Info("去重后面数: %d", len(dedupRaw))
+	if len(dedupRaw) == 0 {
+		defaultLogger.Warn("去重后无有效面，返回空等值面")
+		return nil
+	}
 
 	// 4. 转换为 polyWithLevel，level 稍后计算
 	mergedPolys := make([]polyWithLevel, len(dedupRaw))
 	for i, poly := range dedupRaw {
 		mergedPolys[i] = polyWithLevel{poly: poly}
 	}
-	fmt.Printf("  合并后面数: %d\n", len(mergedPolys))
+	defaultLogger.Info("合并后面数: %d", len(mergedPolys))
 
 	// 5. 为每个多边形计算 level
+	levelEnd := defaultLogger.BeginStep("等值面 level 计算")
 	var wg sync.WaitGroup
 	p, _ := ants.NewPoolWithFunc(runtime.NumCPU(), func(body interface{}) {
 		defer wg.Done()
 		idx := body.(int)
 		mergedPolys[idx].level = computePolygonLevel(mergedPolys[idx].poly, entries, opt)
-
 	})
 	defer p.Release()
-	// 逐层提取等值线：为每个 level 单独渲染到记录 canvas
 	for idx := range mergedPolys {
 		wg.Add(1)
 		_ = p.Invoke(idx)
 	}
 	wg.Wait()
+	levelEnd(nil, nil)
+
 	// 6. 转换为 GeoJSON Feature
 	var result []*geojson.Feature
 	totalArea := 0.0
+	emptyCount := 0
 	for _, mp := range mergedPolys {
+		if len(mp.poly) == 0 || len(mp.poly[0]) < 4 {
+			emptyCount++
+			continue
+		}
 		polyArea := planar.Area(mp.poly)
 		totalArea += polyArea
 		feat := polygonToFeature(mp.poly, mp.level, opt)
@@ -110,6 +151,11 @@ func GenerateFaces(features []*geojson.Feature, boundary orb.Polygon, opt Contou
 			result = append(result, feat)
 		}
 	}
+	if emptyCount > 0 {
+		defaultLogger.Debug("跳过了 %d 个空面", emptyCount)
+	}
+	defaultLogger.Info("最终等值面数: %d, 总面积: %.2f", len(result), totalArea)
+	defaultLogger.Summary()
 	return result
 }
 
@@ -169,7 +215,7 @@ func parseContourEntries(features []*geojson.Feature) []contourEntry {
 
 	// 切割条目顺序：闭合环（大→小） + 开线
 	entries := append(closedRings, openLines...)
-	fmt.Printf("  切割条目: 闭环 %d 个, 开线 %d 条\n", len(closedRings), len(openLines))
+	defaultLogger.Debug("切割条目: 闭环 %d 个, 开线 %d 条", len(closedRings), len(openLines))
 	return entries
 }
 
