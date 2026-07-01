@@ -1,3 +1,5 @@
+// Package kriging_contour 提供了基于克里金插值的等值线/等值面生成功能。
+// 本文件包含了数据校验、参数验证和统计信息计算功能。
 package kriging_contour
 
 import (
@@ -7,48 +9,34 @@ import (
 
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/planar"
-	"gonum.org/v1/gonum/mat"
 )
 
-// ============================================================
-//  输入校验与数据清洗
-// ============================================================
-
-// ValidatePoints 校验原始数据点的合法性，自动过滤异常数据。
-//
-// 检查项：
-//   - 点数量是否足够（至少 3 个点才能进行 kriging）
-//   - 坐标是否为 NaN / Inf
-//   - Z 值是否为 NaN / Inf
-//   - 自动去除重复点（坐标完全相同的点）
-//   - 检查点是否共线（所有点落在同一条直线上）
-//
-// 返回值：
-//   - cleaned: 清洗后的合法数据点列表
-//   - warn: 校验过程中的警告信息（非致命）
-//   - err: 致命错误（数据完全不可用）
-func ValidatePoints(points []*Point, minPoints int) (cleaned []*Point, warns []string, err error) {
+// ValidatePoints 对输入数据点进行清洗和校验。
+// 清洗过程包括：过滤 nil 点、NaN 值、Inf 值，按 (X, Y) 坐标去重。
+// 同时检测点是否共线（共线数据不适合克里金插值）。
+// minPoints 为最小有效点数要求，若 <= 0 则默认为 3。
+// 返回清洗后的有效点切片和错误信息。
+func ValidatePoints(points []*Point, minPoints int) (cleaned []*Point, err error) {
 	if minPoints <= 0 {
 		minPoints = 3
 	}
 	if points == nil || len(points) == 0 {
-		return nil, nil, errors.New("点数据为空")
+		return nil, errors.New("点数据为空")
 	}
 	if len(points) < minPoints {
-		return nil, nil, fmt.Errorf("数据点数量不足 (需要至少 %d 个，当前 %d 个)", minPoints, len(points))
+		return nil, fmt.Errorf("数据点数量不足 (需要至少 %d 个，当前 %d 个)", minPoints, len(points))
 	}
 
 	var clean []*Point
-	seen := make(map[string]bool) // 用于去重
+	seen := make(map[string]bool)
 	nanCount, infCount, dupCount := 0, 0, 0
 
 	for _, p := range points {
 		if p == nil {
-			warns = append(warns, "存在 nil 数据点，已跳过")
+			fmt.Println("[WARN] 数据校验警告: 存在 nil 数据点，已跳过")
 			continue
 		}
 
-		// 检查坐标和 Z 值的 NaN / Inf
 		if math.IsNaN(p.X) || math.IsNaN(p.Y) || math.IsNaN(p.Z) {
 			nanCount++
 			continue
@@ -58,7 +46,6 @@ func ValidatePoints(points []*Point, minPoints int) (cleaned []*Point, warns []s
 			continue
 		}
 
-		// 去重（坐标完全相同的点只保留第一个）
 		key := fmt.Sprintf("%.10f,%.10f", p.X, p.Y)
 		if seen[key] {
 			dupCount++
@@ -69,40 +56,37 @@ func ValidatePoints(points []*Point, minPoints int) (cleaned []*Point, warns []s
 		clean = append(clean, &Point{X: p.X, Y: p.Y, Z: p.Z})
 	}
 
-	// 生成警告信息
 	if nanCount > 0 {
-		warns = append(warns, fmt.Sprintf("过滤了 %d 个 NaN 值点", nanCount))
+		fmt.Printf("[WARN] 数据校验警告: 过滤了 %d 个 NaN 值点\n", nanCount)
 	}
 	if infCount > 0 {
-		warns = append(warns, fmt.Sprintf("过滤了 %d 个 Inf 值点", infCount))
+		fmt.Printf("[WARN] 数据校验警告: 过滤了 %d 个 Inf 值点\n", infCount)
 	}
 	if dupCount > 0 {
-		warns = append(warns, fmt.Sprintf("过滤了 %d 个重复点", dupCount))
+		fmt.Printf("[WARN] 数据校验警告: 过滤了 %d 个重复点\n", dupCount)
 	}
 
-	// 检查清洗后的点数量
 	if len(clean) < minPoints {
-		return clean, warns, fmt.Errorf("清洗后有效数据点不足 (需要至少 %d 个，当前 %d 个)", minPoints, len(clean))
+		return clean, fmt.Errorf("清洗后有效数据点不足 (需要至少 %d 个，当前 %d 个)", minPoints, len(clean))
 	}
 
-	// 检查是否共线（至少 3 个点才检查）
 	if len(clean) >= 3 {
 		if isCollinearPoints(clean) {
-			warns = append(warns, "所有数据点共线，克里金插值结果可能不准确")
+			fmt.Println("[WARN] 数据校验警告: 所有数据点共线，克里金插值结果可能不准确")
 		}
 	}
 
-	return clean, warns, nil
+	return clean, nil
 }
 
-// isCollinearPoints 检查所有点是否近似共线。
-// 使用协方差矩阵的行列式来判断：行列式接近零表示共线。
+// isCollinearPoints 通过 PCA 思想检测所有数据点是否近似共线。
+// 计算 X、Y 坐标的协方差矩阵行列式，若行列式相对缩放因子极小，
+// 则判断为共线。共线的点无法进行有意义的二维克里金插值。
 func isCollinearPoints(points []*Point) bool {
 	if len(points) < 3 {
 		return false
 	}
 
-	// 计算点的协方差矩阵
 	var sumX, sumY float64
 	for _, p := range points {
 		sumX += p.X
@@ -120,73 +104,59 @@ func isCollinearPoints(points []*Point) bool {
 		covXY += dx * dy
 	}
 
-	// | covXX  covXY |
-	// | covXY  covYY | = covXX * covYY - covXY²
 	det := covXX*covYY - covXY*covXY
-
-	// 行列式小于阈值说明点近似共线
-	// 使用相对于数据尺度的阈值
 	scale := covXX + covYY
 	if scale < 1e-15 {
-		// 所有点的坐标基本相同，视为退化
 		return true
 	}
 
 	return math.Abs(det)/scale < 1e-10
 }
 
-// ValidateBoundary 校验边界多边形的合法性。
-//
-// 检查项：
-//   - 多边形不能为空
-//   - 外环顶点数不能少于 3
-//   - 外环不能自交（使用 O(n²) 线段交叉检测）
-//   - 面积不能过小
-func ValidateBoundary(boundary orb.Polygon) (warns []string, err error) {
+// ValidateBoundary 校验边界多边形的有效性。
+// 检查内容包括：多边形是否为空、外环顶点数是否足够、外环是否自交、
+// 面积是否过小。边界多边形用于裁剪等值线和限制插值范围。
+func ValidateBoundary(boundary orb.Polygon) error {
 	if len(boundary) == 0 {
-		return nil, errors.New("边界多边形为空")
+		return errors.New("边界多边形为空")
 	}
 
 	exterior := boundary[0]
 	if len(exterior) < 4 {
-		return nil, fmt.Errorf("边界多边形外环顶点数不足 (当前 %d 个，至少需要 3 个)", len(exterior)-1)
+		return fmt.Errorf("边界多边形外环顶点数不足 (当前 %d 个，至少需要 3 个)", len(exterior)-1)
 	}
 
-	// 检查自交
 	if isRingSelfIntersecting(exterior) {
-		return nil, errors.New("边界多边形外环存在自交")
+		return errors.New("边界多边形外环存在自交")
 	}
 
-	// 检查面积
 	area := math.Abs(planar.Area(boundary))
 	if area < 1e-8 {
-		return nil, fmt.Errorf("边界多边形面积过小: %.2e", area)
+		return fmt.Errorf("边界多边形面积过小: %.2e", area)
 	}
 
-	return nil, nil
+	return nil
 }
 
-// isRingSelfIntersecting 检测多边形环是否自交。
-// 使用 O(n²) 线段交叉检测，排除相邻边。
+// isRingSelfIntersecting 检测多边形环是否存在自交。
+// 遍历所有非相邻线段对，使用严格相交判断算法检测。
+// 相邻边和通过首尾相连的边对不视为自交。
 func isRingSelfIntersecting(ring orb.Ring) bool {
 	n := len(ring)
 	if n <= 1 {
 		return false
 	}
-	// 去掉闭合顶点
 	if ring[0] == ring[n-1] {
 		n--
 	}
 
 	for i := 0; i < n; i++ {
 		for j := i + 2; j < n; j++ {
-			// 跳过相邻边和首尾相连的边
 			if i == 0 && j == n-1 {
 				continue
 			}
 			a, b := ring[i], ring[(i+1)%n]
 			c, d := ring[j], ring[(j+1)%n]
-			// 检查线段是否相交（非端点接触）
 			if segmentsStrictlyIntersect(a, b, c, d) {
 				return true
 			}
@@ -195,63 +165,61 @@ func isRingSelfIntersecting(ring orb.Ring) bool {
 	return false
 }
 
-// segmentsStrictlyIntersect 严格检查线段 AB 与 CD 是否在内部相交（排除端点接触）。
+// segmentsStrictlyIntersect 判断两条线段是否严格相交（不包括端点重合的情况）。
+// 使用参数方法计算交点参数 t 和 u，仅当二者均在开区间 (0, 1) 时返回 true。
 func segmentsStrictlyIntersect(a, b, c, d orb.Point) bool {
 	denom := (b[0]-a[0])*(d[1]-c[1]) - (b[1]-a[1])*(d[0]-c[0])
 	if math.Abs(denom) < 1e-15 {
-		return false // 平行或共线
+		return false
 	}
 
 	t := ((c[0]-a[0])*(d[1]-c[1]) - (c[1]-a[1])*(d[0]-c[0])) / denom
 	u := -((b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])) / denom
 
-	// 严格内部相交：t 和 u 都在 (0, 1) 开区间内
 	return t > 1e-12 && t < 1-1e-12 && u > 1e-12 && u < 1-1e-12
 }
 
-// ValidateContourOption 校验等值线参数配置。
-func ValidateContourOption(opt ContourOption) (warns []string, err error) {
+// ValidateContourOption 校验等值线配置参数。
+// 校验 Resolution 范围，校验 LevelList 或 ContourInterval 必须指定一项。
+// LevelList 的实际计算由 GetLevelList 完成，调用方负责在合适的时机补全。
+func ValidateContourOption(opt *ContourOption) error {
 	if opt.Resolution <= 0 {
-		return nil, fmt.Errorf("分辨率必须为正数，当前: %d", opt.Resolution)
+		return fmt.Errorf("分辨率必须为正数，当前: %d", opt.Resolution)
 	}
 	if opt.Resolution < 10 {
-		warns = append(warns, fmt.Sprintf("分辨率过小 (%d)，可能导致结果精度较低", opt.Resolution))
+		fmt.Printf("[WARN] 参数校验警告: 分辨率过小 (%d)，可能导致结果精度较低\n", opt.Resolution)
 	}
 	if opt.Resolution > 1000 {
-		warns = append(warns, fmt.Sprintf("分辨率过大 (%d)，可能导致性能问题", opt.Resolution))
+		fmt.Printf("[WARN] 参数校验警告: 分辨率过大 (%d)，可能导致性能问题\n", opt.Resolution)
 	}
 
-	if opt.ContourInterval <= 0 {
-		return nil, fmt.Errorf("等值线间隔必须为正数，当前: %f", opt.ContourInterval)
+	if len(opt.LevelList) == 0 && opt.ContourInterval <= 0 {
+		return fmt.Errorf("必须指定 level_list 或 contour_start/contour_end/contour_interval")
 	}
 
-	if opt.ContourStart > opt.ContourEnd && opt.ContourEnd != 0 {
-		warns = append(warns, fmt.Sprintf("等值线起始值 (%f) 大于结束值 (%f)，将互换", opt.ContourStart, opt.ContourEnd))
-	}
-
-	return warns, nil
+	return nil
 }
 
-// ============================================================
-//  统计信息收集
-// ============================================================
-
-// DataStats 数据统计信息
+// DataStats 存储输入数据的统计信息。
+// 包含数据清洗前后的计数、各坐标维度的范围、Z 值的均值/标准差，
+// 以及是否共线的判断结果。
 type DataStats struct {
-	OriginalCount int
-	CleanedCount  int
-	NanCount      int
-	InfCount      int
-	DupCount      int
-	MinX, MaxX    float64
-	MinY, MaxY    float64
-	MinZ, MaxZ    float64
-	MeanZ         float64
-	StdZ          float64
-	IsCollinear   bool
+	OriginalCount int     // 原始数据点数
+	CleanedCount  int     // 清洗后有效数据点数
+	NanCount      int     // NaN 值数量
+	InfCount      int     // Inf 值数量
+	DupCount      int     // 重复点数量
+	MinX, MaxX    float64 // X 坐标范围
+	MinY, MaxY    float64 // Y 坐标范围
+	MinZ, MaxZ    float64 // Z 值范围
+	MeanZ         float64 // Z 值均值
+	StdZ          float64 // Z 值标准差
+	IsCollinear   bool    // 数据是否近似共线
 }
 
-// ComputeDataStats 计算数据点的统计信息。
+// ComputeDataStats 计算输入数据点的统计信息（不修改原始数据）。
+// 执行与 ValidatePoints 相同的 NaN/Inf/重复点过滤，但不返回清洗后的数据，
+// 只返回统计数据。用于在 GenerateLines 中输出数据概况。
 func ComputeDataStats(points []*Point) DataStats {
 	var stats DataStats
 	stats.OriginalCount = len(points)
@@ -329,103 +297,4 @@ func ComputeDataStats(points []*Point) DataStats {
 
 	stats.IsCollinear = isCollinearPoints(clean)
 	return stats
-}
-
-// ============================================================
-//  Fallback 机制：当克里金插值失败时使用简单插值
-// ============================================================
-
-// fallbackIDW 逆距离加权插值（IDW），作为克里金插值的后备方案。
-// 当克里金矩阵不可逆或拟合失败时，使用 IDW 生成网格。
-func fallbackIDW(points []*Point, gridX, gridY []float64) *GridData {
-	if len(points) == 0 {
-		return nil
-	}
-
-	rows := len(gridY)
-	cols := len(gridX)
-	if rows == 0 || cols == 0 {
-		return nil
-	}
-
-	// 提取坐标和值
-	xs := make([]float64, len(points))
-	ys := make([]float64, len(points))
-	zs := make([]float64, len(points))
-	for i, p := range points {
-		xs[i] = p.X
-		ys[i] = p.Y
-		zs[i] = p.Z
-	}
-
-	// 计算数据点的空间范围用于尺度归一化
-	minX, maxX := xs[0], xs[0]
-	minY, maxY := ys[0], ys[0]
-	for i := range xs {
-		if xs[i] < minX {
-			minX = xs[i]
-		}
-		if xs[i] > maxX {
-			maxX = xs[i]
-		}
-		if ys[i] < minY {
-			minY = ys[i]
-		}
-		if ys[i] > maxY {
-			maxY = ys[i]
-		}
-	}
-	scaleX := maxX - minX
-	scaleY := maxY - minY
-	if scaleX < 1e-10 {
-		scaleX = 1.0
-	}
-	if scaleY < 1e-10 {
-		scaleY = 1.0
-	}
-
-	// 对每个网格点进行 IDW 插值
-	power := 2.0 // 距离的幂,幂越高越受近点影响
-	zData := make([]float64, rows*cols)
-	for r := 0; r < rows; r++ {
-		for c := 0; c < cols; c++ {
-			tx := gridX[c]
-			ty := gridY[r]
-			var weightSum, valueSum float64
-
-			for i := range xs {
-				dx := (tx - xs[i]) / scaleX
-				dy := (ty - ys[i]) / scaleY
-				dist := math.Sqrt(dx*dx + dy*dy)
-
-				// 如果网格点与数据点重合，直接使用该数据点的值
-				if dist < 1e-12 {
-					valueSum = zs[i]
-					weightSum = 1.0
-					break
-				}
-
-				w := 1.0 / math.Pow(dist, power)
-				weightSum += w
-				valueSum += w * zs[i]
-			}
-
-			if weightSum > 0 {
-				zData[r*cols+c] = valueSum / weightSum
-			} else {
-				// 极端情况：使用均值
-				meanZ := 0.0
-				for i := range zs {
-					meanZ += zs[i]
-				}
-				zData[r*cols+c] = meanZ / float64(len(zs))
-			}
-		}
-	}
-
-	return &GridData{
-		Z: mat.NewDense(rows, cols, zData),
-		X: gridX,
-		Y: gridY,
-	}
 }

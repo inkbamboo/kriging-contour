@@ -1,335 +1,203 @@
-// Package kriging_contour 基于克里金插值（Ordinary Kriging）从离散空间数据点生成等值线（LineString）和等值面（Polygon）。
-//
-// 主要功能：
-//   - generateGrid: 使用克里金插值将离散点转换为规则网格
-//   - GenerateLines: 从网格中提取等值线（marching squares 算法），含裁剪、合并、方向统一、短线过滤
-//   - GenerateFaces: 基于等值线进行遍历分割生成等值面
-//
-// 等值线方向统一遵循右手定则：沿线条走向，高值区在左侧。
-// 坐标系统：输入数据使用 [lon, lat] 坐标，输出 GeoJSON 使用 [lat, lon]。
+// Package kriging_contour 提供了基于克里金插值的等值线/等值面生成功能。
+// 本文件包含了等值线生成的算法实现，包括网格插值、等值线提取、几何处理等。
 package kriging_contour
 
 import (
 	"fmt"
-	"image/color"
-	"image/png"
 	"math"
-	"os"
 	"runtime"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/duke-git/lancet/v2/maputil"
-	"github.com/inkbamboo/kriging-contour/internal/contour"
-	"github.com/inkbamboo/kriging-contour/internal/kriging"
 	"github.com/inkbamboo/kriging-contour/internal/utils"
 	"github.com/panjf2000/ants/v2"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/geojson"
 	"github.com/paulmach/orb/planar"
-	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/font"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
 	"gonum.org/v1/plot/vg/draw"
-	"gonum.org/v1/plot/vg/vgimg"
 )
 
-// defaultLogger 包级默认日志记录器，可通过 SetLogger 替换。
-var defaultLogger = utils.NewStepLogger(os.Stdout)
-
-// SetLogger 设置全局日志记录器的输出目标。设为 nil 则抑制所有日志。
-func SetLogger(writer *os.File) {
-	if writer == nil {
-		defaultLogger.SetLevel(utils.LogLevelError + 1) // 抑制所有级别
-	} else {
-		defaultLogger = utils.NewStepLogger(writer)
-	}
-}
-
-// SetLogLevel 设置全局日志级别。
-func SetLogLevel(level utils.LogLevel) {
-	defaultLogger.SetLevel(level)
-}
-
-// GetLogger 返回当前的日志记录器，供外部调用者获取执行摘要。
-func GetLogger() *utils.StepLogger {
-	return defaultLogger
-}
-
-// generateGrid 基于离散数据点和边界多边形，使用克里金插值（Ordinary Kriging）生成规则网格数据。
-//
-// 参数:
-//   - points: 原始数据点列表，X/Y 为经纬度坐标，Z 为测量值
-//   - boundary: 区域边界多边形，坐标顺序为 [lat, lon]
-//   - opt: 等值线参数配置，Resolution 决定网格密度
-//
-// 返回:
-//   - grid: 插值后的网格数据，Z 矩阵行对应纬度、列对应经度
-//   - err: 克里金插值失败时返回错误
-//
-// 插值结果会进行归一化缩放：若指定了 ContourStart/ContourEnd 则缩放到该范围，
-// 否则缩放到原始数据的值域范围。
-func generateGrid(points []*Point, boundary orb.Polygon, opt ContourOption) (grid *GridData, err error) {
-	end := defaultLogger.BeginStep("克里金网格插值")
-	defer func() {
-		end(err, nil)
-	}()
-
-	minLon, maxLon := boundary.Bound().Min[1], boundary.Bound().Max[1]
-	minLat, maxLat := boundary.Bound().Min[0], boundary.Bound().Max[0]
-	gridX, gridY := kriging.GenerateGrid(minLon, minLat, maxLon, maxLat, opt.Resolution)
-
-	defaultLogger.Debug("网格尺寸: %d × %d (lon: %.4f~%.4f, lat: %.4f~%.4f)",
-		len(gridX), len(gridY), minLon, maxLon, minLat, maxLat)
-
-	config := kriging.DefaultOKConfig()
-	config.CoordinatesType = "euclidean"
-	config.VariogramModel = "spherical"
-	config.Verbose = false // 克里金内部日志关闭，用我们的统一日志
-
-	x := make([]float64, len(points))
-	y := make([]float64, len(points))
-	z := make([]float64, len(points))
-	for i, p := range points {
-		x[i] = p.Y
-		y[i] = p.X
-		z[i] = p.Z
-	}
-
-	// 捕获克里金构建过程中的 panic
-	var ok *kriging.OrdinaryKriging
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("克里金模型构建 panic: %v", r)
-				defaultLogger.Error("克里金模型构建 panic，将使用 fallback IDW 插值: %v", r)
-			}
-		}()
-		ok, err = kriging.NewOrdinaryKriging(x, y, z, config)
-	}()
-
-	if err != nil || ok == nil {
-		err = fmt.Errorf("克里金插值失败 (将使用 IDW fallback): %w", err)
-		defaultLogger.Warn("克里金插值失败，启用 IDW fallback 插值")
-
-		// fallback: 使用逆距离加权插值 (IDW)
-		grid = fallbackIDW(points, gridX, gridY)
-		if grid == nil {
-			return nil, fmt.Errorf("IDW fallback 插值也失败: 无法生成网格")
-		}
-		origMin, origMax := utils.MinMax(z...)
-		gridMin, gridMax := utils.MinMax(grid.Z.RawMatrix().Data...)
-		normalizeGrid(grid, gridMin, gridMax, origMin, origMax, opt)
-		return grid, nil
-	}
-
-	// 捕获 ExecuteGrid 过程中的 panic
-	var zvGrid *mat.Dense
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("克里金网格执行 panic: %v", r)
-				defaultLogger.Error("克里金网格执行 panic，将使用 fallback IDW 插值: %v", r)
-			}
-		}()
-		zvGrid, _ = ok.ExecuteGrid(gridX, gridY)
-	}()
-
-	if err != nil || zvGrid == nil {
-		err = fmt.Errorf("克里金网格执行失败 (将使用 IDW fallback): %w", err)
-		defaultLogger.Warn("克里金网格执行失败，启用 IDW fallback 插值")
-
-		grid = fallbackIDW(points, gridX, gridY)
-		if grid == nil {
-			return nil, fmt.Errorf("IDW fallback 插值也失败: 无法生成网格")
-		}
-		origMin, origMax := utils.MinMax(z...)
-		gridMin, gridMax := utils.MinMax(grid.Z.RawMatrix().Data...)
-		normalizeGrid(grid, gridMin, gridMax, origMin, origMax, opt)
-		return grid, nil
-	}
-
-	origMin, origMax := utils.MinMax(z...)
-	gridMin, gridMax := utils.MinMax(zvGrid.RawMatrix().Data...)
-
-	defaultLogger.Debug("Kriging 结果范围: [%.4f, %.4f], 原始范围: [%.4f, %.4f]",
-		gridMin, gridMax, origMin, origMax)
-
-	// 检查插值结果是否有效
-	if math.IsNaN(gridMin) || math.IsNaN(gridMax) || math.IsInf(gridMin, 0) || math.IsInf(gridMax, 0) {
-		defaultLogger.Warn("克里金插值结果包含 NaN/Inf，使用 IDW fallback")
-		grid = fallbackIDW(points, gridX, gridY)
-		if grid != nil {
-			gMin, gMax := utils.MinMax(grid.Z.RawMatrix().Data...)
-			normalizeGrid(grid, gMin, gMax, origMin, origMax, opt)
-		}
-		return grid, nil
-	}
-
-	grid = &GridData{
-		Z: zvGrid,
-		X: gridX,
-		Y: gridY,
-	}
-
-	normalizeGrid(grid, gridMin, gridMax, origMin, origMax, opt)
-	err = nil // 成功，清除 fallback 产生的错误
-	return grid, nil
-}
-
-// normalizeGrid 对克里金插值结果进行归一化缩放。
-func normalizeGrid(grid *GridData, gridMin, gridMax, origMin, origMax float64, opt ContourOption) {
-	rows, cols := grid.Z.Dims()
-	if gridMax-gridMin <= 1e-10 {
-		return
-	}
-	if opt.ContourEnd-opt.ContourStart > 1e-10 {
-		// 如果指定了等值线范围，缩放到等值线范围
-		for i := 0; i < rows; i++ {
-			for j := 0; j < cols; j++ {
-				v := grid.Z.At(i, j)
-				v = opt.ContourStart + (v-gridMin)/(gridMax-gridMin)*(opt.ContourEnd-opt.ContourStart)
-				grid.Z.Set(i, j, v)
-			}
-		}
-	} else if origMax-origMin > 1e-10 {
-		// 否则缩放到原始数据范围
-		for i := 0; i < rows; i++ {
-			for j := 0; j < cols; j++ {
-				v := grid.Z.At(i, j)
-				v = origMin + (v-gridMin)/(gridMax-gridMin)*(origMax-origMin)
-				grid.Z.Set(i, j, v)
-			}
-		}
-	}
-}
-
-// getContourLevels 根据 ContourOption 生成等值线级别（level）列表。
-// 从 ContourStart 开始，以 ContourInterval 为步长递增，不超过 ContourEnd。
-// 若 ContourEnd 未指定或为零，则自动推断为数据最大值。
-func getContourLevels(grid *GridData, opt ContourOption) []float64 {
-	if opt.ContourInterval <= 0 {
-		return nil
-	}
-
-	gridMin, gridMax := utils.MinMax(grid.Z.RawMatrix().Data...)
-	start := opt.ContourStart
-	end := opt.ContourEnd
-
-	if end-start <= 1e-10 {
-		// ContourEnd=0 或未指定，自动推断
-		end = gridMax
-	}
-
-	var levels []float64
-	for lv := start; lv <= end+1e-10; lv += opt.ContourInterval {
-		if lv >= gridMin && lv <= gridMax {
-			levels = append(levels, lv)
-		}
-	}
-	return levels
-}
-
-// plotMutex 保护 gonum plot 底层 marching squares 算法中的全局缓冲区不被并发争用。
-// gonum plot 的 Contour.Plot 方法内部使用了包级全局变量，并发调用会导致数据损坏。
+// plotMutex 保护 gonum/plot 的渲染操作，因为 plotter.NewContour 不是并发安全的。
 var plotMutex sync.Mutex
 
-// extractCoords 将 vg.Path 中的画布坐标（像素空间）逆映射为数据坐标系下的实际坐标。
-// canvasSize 为画布边长（正方形），xMin/xMax/yMin/yMax 为数据域的边界范围。
-func extractCoords(p vg.Path, xMin, xMax, yMin, yMax, canvasSize float64) []orb.Point {
-	var pts []orb.Point
+// tolerance 线段端点合并的容差距离。用于 mergeConnectedLines 中判断两条线段是否端点重合。
+var tolerance = 0.01
+
+// extractCoords 将 vg.Path 中的点坐标从画布空间转换回数据空间。
+// canvasSize 为画布尺寸，xMin/xMax/yMin/yMax 为数据范围。
+// 返回经四舍五入（保留 6 位小数）的地理坐标点序列。
+func extractCoords(p vg.Path, xMin, xMax, yMin, yMax, canvasSize float64) []*orb.Point {
+	var pts []*orb.Point
 	for _, comp := range p {
 		if comp.Type != vg.MoveComp && comp.Type != vg.LineComp {
 			continue
 		}
 		x := float64(comp.Pos.X)/canvasSize*(xMax-xMin) + xMin
 		y := float64(comp.Pos.Y)/canvasSize*(yMax-yMin) + yMin
-		pts = append(pts, orb.Point{x, y})
+		pts = append(pts, &orb.Point{math.Round(x*1e6) / 1e6, math.Round(y*1e6) / 1e6})
 	}
 	return pts
 }
 
-// GenerateLines 基于离散点数据和边界多边形生成等值线（LineString）。
+// GenerateLines 从散点数据生成等值线。这是等值线生成的主入口函数。
 //
-// 流程:
-//  1. 调用 generateGrid 进行克里金插值生成网格数据
-//  2. 使用 marching squares 算法从网格中提取等值线
-//  3. 用 boundary 裁剪等值线，仅保留边界内部的部分
-//  4. 合并首尾相连的线段，统一等值线方向（右手定则：高值在左）
-//  5. 输出坐标转换为 [lat, lon] 格式与 boundary 对齐
+// 完整流程：
+//  1. 输出数据统计信息
+//  2. 校验参数和数据
+//  3. 执行克里金插值生成网格（GenerateGrid）
+//  4. 从网格中提取等值线（extractLinesFromGrid）
 //
-// 参数:
-//   - points: 原始数据点
-//   - boundary: 区域边界多边形
-//   - opt: 等值线参数（ContourStart/End/Interval/Resolution/ImagePath）
+// 参数：
+//   - points: 离散采样点数据
+//   - boundary: 边界多边形，用于裁剪等值线和限制插值范围
+//   - opt: 等值线生成配置参数
 //
-// 返回: GeoJSON Feature 列表，每个 Feature 为一条等值线(LineString)，
-//
-//	properties 含 level/is_closed/high_value_side 等字段。
-//	最后一项为边界多边形 feature（properties["type"] = "boundary"）。
-func GenerateLines(points []*Point, boundary orb.Polygon, opt ContourOption) []*geojson.Feature {
-	// ========== 输入校验 ==========
+// 返回 GeoJSON Feature 切片，每个 Feature 代表一条等值线。
+func GenerateLines(points []*Point, boundary orb.Polygon, opt *ContourOption) []*geojson.Feature {
 	stats := ComputeDataStats(points)
-	defaultLogger.Info("原始数据点: %d, 有效点: %d, X范围: [%.4f, %.4f], Y范围: [%.4f, %.4f], Z范围: [%.4f, %.4f], NaN: %d, Inf: %d, 重复: %d",
+	fmt.Printf("[INFO] 原始数据点: %d, 有效点: %d, X范围: [%.4f, %.4f], Y范围: [%.4f, %.4f], Z范围: [%.4f, %.4f], NaN: %d, Inf: %d, 重复: %d\n",
 		stats.OriginalCount, stats.CleanedCount,
 		stats.MinX, stats.MaxX, stats.MinY, stats.MaxY,
 		stats.MinZ, stats.MaxZ, stats.NanCount, stats.InfCount, stats.DupCount)
+	var err error
 
-	cleanPoints, warns, err := ValidatePoints(points, 3)
-	for _, w := range warns {
-		defaultLogger.Warn("数据校验警告: %s", w)
+	if points, err = CheckParams(points, boundary, opt); err != nil {
+		return nil
 	}
-	if err != nil {
-		defaultLogger.Error("数据校验失败: %v", err)
+	var grid *Grid
+	if grid, err = GenerateGrid(points, boundary, opt.Resolution, opt.LevelList); err != nil || grid == nil {
+		fmt.Printf("[ERROR] 网格生成失败: %v\n", err)
 		return nil
 	}
 
-	boundaryWarns, err := ValidateBoundary(boundary)
-	for _, w := range boundaryWarns {
-		defaultLogger.Warn("边界校验警告: %s", w)
+	return extractLinesFromGrid(grid, boundary, opt)
+}
+
+// CheckParams 串联调用 ValidatePoints、ValidateContourOption 和 ValidateBoundary，
+// 对数据、参数和边界进行完整校验。返回清洗后的数据点。
+func CheckParams(points []*Point, boundary orb.Polygon, opt *ContourOption) (cleanPoints []*Point, err error) {
+	if len(points) == 0 {
+		fmt.Printf("[ERROR] 数据为空\n")
+		return nil, fmt.Errorf("数据为空")
 	}
-	if err != nil {
-		defaultLogger.Error("边界校验失败: %v", err)
+	if opt == nil {
+		fmt.Printf("[ERROR] 参数为空\n")
+		return nil, fmt.Errorf("参数为空")
+	}
+	if cleanPoints, err = ValidatePoints(points, 3); err != nil {
+		fmt.Printf("[ERROR] 数据校验失败: %v\n", err)
+		return
+	}
+	if err = ValidateContourOption(opt); err != nil {
+		fmt.Printf("[ERROR] 参数校验失败: %v\n", err)
+		return
+	}
+	if err = ValidateBoundary(boundary); err != nil {
+		fmt.Printf("[ERROR] 边界校验失败: %v\n", err)
+		return
+	}
+	// 根据清洗后的数据补全 LevelList（若未显式指定）
+	if len(opt.LevelList) == 0 {
+		opt.LevelList = GetLevelList(cleanPoints, opt)
+	}
+	return
+}
+
+// GetLevelList 根据散点数据和配置参数计算等值线级别列表。
+//
+// 从 points 中提取有效的 Z 值范围（过滤 nil/NaN/Inf），
+// 然后调用 opt.GetLevelList(minZ, maxZ) 生成级别列表。
+func GetLevelList(points []*Point, opt *ContourOption) []float64 {
+	if len(opt.LevelList) > 0 {
+		return opt.LevelList
+	}
+
+	minZ, maxZ := math.Inf(1), math.Inf(-1)
+	firstValid := true
+
+	for _, p := range points {
+		if p == nil || math.IsNaN(p.Z) || math.IsInf(p.Z, 0) {
+			continue
+		}
+		if firstValid {
+			minZ, maxZ = p.Z, p.Z
+			firstValid = false
+		} else {
+			if p.Z < minZ {
+				minZ = p.Z
+			}
+			if p.Z > maxZ {
+				maxZ = p.Z
+			}
+		}
+	}
+	start := opt.ContourStart
+	end := opt.ContourEnd
+
+	if start == 0 && end == 0 {
+		start = math.Floor(minZ/opt.ContourInterval) * opt.ContourInterval
+		if start >= minZ {
+			start -= opt.ContourInterval
+		}
+		end = math.Ceil(maxZ/opt.ContourInterval) * opt.ContourInterval
+		if end <= maxZ {
+			end += opt.ContourInterval
+		}
+	}
+
+	if start > end {
+		start, end = end, start
+	}
+
+	var list []float64
+	for lv := start; lv <= end+1e-10; lv += opt.ContourInterval {
+		list = append(list, math.Round(lv*1e4)/1e4)
+	}
+	return list
+}
+
+// GenerateLinesByGrid 基于已有的插值网格直接提取等值线。
+// 适用于需要自定义插值参数或复用已有网格的场景。
+func GenerateLinesByGrid(grid *Grid, boundary orb.Polygon, opt *ContourOption) []*geojson.Feature {
+	if grid == nil {
+		fmt.Printf("[ERROR] 网格为空\n")
 		return nil
 	}
 
-	optWarns, err := ValidateContourOption(opt)
-	for _, w := range optWarns {
-		defaultLogger.Warn("参数校验警告: %s", w)
-	}
-	if err != nil {
-		defaultLogger.Error("参数校验失败: %v", err)
+	return extractLinesFromGrid(grid, boundary, opt)
+}
+
+// extractLinesFromGrid 从插值网格中提取所有等值线。
+//
+// 处理步骤：
+//  1. 确保边界多边形闭合
+//  2. 使用 goroutine 池并行处理每个 level
+//  3. 对每条等值线进行合并、裁剪、定向
+//  4. 附加边界 Feature
+//  5. 可选渲染 PNG 图片
+func extractLinesFromGrid(grid *Grid, boundary orb.Polygon, opt *ContourOption) []*geojson.Feature {
+	fmt.Printf("[INFO] 等值线级别数: %d\n", len(opt.LevelList))
+	closeBoundaryPolygon(boundary)
+	extractStart := time.Now()
+	fmt.Printf("[INFO] 步骤开始: 等值线提取\n")
+	if len(opt.LevelList) == 0 {
+		fmt.Printf("[WARN] 没有有效的等值线级别\n")
+		fmt.Printf("[WARN] 步骤完成(有警告): 等值线提取 (耗时: %v)\n", time.Since(extractStart).Round(time.Millisecond))
 		return nil
 	}
 
-	// ========== 克里金插值 ==========
-	grid, err := generateGrid(cleanPoints, boundary, opt)
-	if err != nil {
-		defaultLogger.Error("网格生成失败: %v", err)
-		return nil
-	}
-
-	defaultLogger.Info("等值线级别数: %d", len(getContourLevels(grid, opt)))
-
-	// ========== 等值线提取 ==========
-	levelEnd := defaultLogger.BeginStep("等值线提取")
-	levels := getContourLevels(grid, opt)
-	if len(levels) == 0 {
-		defaultLogger.Warn("没有有效的等值线级别")
-		levelEnd(nil, map[string]interface{}{"warning": "无有效级别"})
-		return nil
-	}
-
-	rows, cols := grid.Z.Dims()
+	rows, cols := grid.Data.Dims()
 	if rows < 2 || cols < 2 {
-		defaultLogger.Error("网格尺寸过小: %d × %d", rows, cols)
-		levelEnd(fmt.Errorf("网格尺寸过小"), nil)
+		fmt.Printf("[ERROR] 网格尺寸过小: %d × %d\n", rows, cols)
+		fmt.Printf("[ERROR] 步骤失败: 等值线提取 (耗时: %v) - 网格尺寸过小\n", time.Since(extractStart).Round(time.Millisecond))
 		return nil
 	}
-	cg := contour.NewGrid(grid.X, grid.Y, grid.Z, cols, rows)
-
 	const canvasSize = 2000.0
 
 	var features []*geojson.Feature
@@ -339,71 +207,64 @@ func GenerateLines(points []*Point, boundary orb.Polygon, opt ContourOption) []*
 	baseProperties := maputil.Merge(map[string]interface{}{
 		"type": opt.ContourType,
 	}, opt.Extra)
+	// 使用 goroutine 池并行处理每个 level 的等值线提取
 	p, _ := ants.NewPoolWithFunc(runtime.NumCPU(), func(body interface{}) {
 		defer wg.Done()
-		levelFeatures := generateLevelLines(cg, body.(float64), canvasSize, boundary, baseProperties)
+		levelFeatures := generateLevelLines(grid, body.(float64), canvasSize, boundary, baseProperties)
 		lock.Lock()
 		features = append(features, levelFeatures...)
 		defer lock.Unlock()
 	})
 	defer p.Release()
-	// 逐层提取等值线：为每个 level 单独渲染到记录 canvas
-	for _, level := range levels {
+	for _, level := range opt.LevelList {
 		wg.Add(1)
 		_ = p.Invoke(level)
 	}
 	wg.Wait()
 
-	levelEnd(nil, map[string]interface{}{"features": len(features)})
-	defaultLogger.Info("等值线总数: %d", len(features))
+	fmt.Printf("[INFO] 步骤完成: 等值线提取 (耗时: %v, features: %d)\n", time.Since(extractStart).Round(time.Millisecond), len(features))
+	fmt.Printf("[INFO] 等值线总数: %d\n", len(features))
 
-	boundaryFeature := geojson.NewFeature(closeBoundaryPolygon(boundary))
+	// 附加边界 Feature
+	boundaryFeature := geojson.NewFeature(boundary)
 	boundaryFeature.Properties = maputil.Merge(map[string]interface{}{"type": "boundary"}, opt.Extra)
 	features = append(features, boundaryFeature)
 
-	// 如果指定了图片路径，渲染所有等值线为一张 PNG 图片
 	if opt.ImagePath != "" {
-		imgEnd := defaultLogger.BeginStep("渲染等值线图片")
-		renderContourImage(cg, levels, opt.ImagePath)
-		imgEnd(nil, nil)
+		imgStart := time.Now()
+		fmt.Printf("[INFO] 步骤开始: 渲染等值线图片%+v\n", opt.LevelList)
+		renderContourImage(grid, opt.LevelList, opt.ImagePath)
+		fmt.Printf("[INFO] 步骤完成: 渲染等值线图片 (耗时: %v)\n", time.Since(imgStart).Round(time.Millisecond))
 	}
 
-	// 输出处理摘要
-	defaultLogger.Summary()
 	return features
 }
 
-// closeBoundaryPolygon 确保多边形所有环的首尾点一致（闭合）。
-// 对于每个环，若首尾点不重合，则追加首点到末尾形成闭合环。
-// 返回新的闭合多边形，不修改原始数据。
-func closeBoundaryPolygon(poly orb.Polygon) orb.Polygon {
-	result := make(orb.Polygon, len(poly))
+// closeBoundaryPolygon 确保多边形的所有环都是闭合的（首尾点相同）。
+func closeBoundaryPolygon(poly orb.Polygon) {
 	for ri, ring := range poly {
-		nr := make(orb.Ring, len(ring))
-		copy(nr, ring)
-		if len(nr) > 0 && nr[0] != nr[len(nr)-1] {
-			nr = append(nr, nr[0])
+		if len(ring) > 0 && ring[0] != ring[len(ring)-1] {
+			poly[ri] = append(ring, ring[0])
 		}
-		result[ri] = nr
 	}
-	return result
 }
 
-// generateLevelLines 为单个等值线级别生成等值线 GeoJSON Feature 列表。
+// generateLevelLines 为单个等值线 level 生成 GeoJSON Feature 列表。
 //
-// 流程：
-//  1. 使用 gonum/plot 的 Contour.Plot 在虚拟画布上渲染该 level 的等值线
-//  2. 从记录画布（Canvas）中提取 vg.Path 并逆变换为数据坐标
-//  3. 用 boundary 裁剪，仅保留边界内部部分
-//  4. 合并首尾相连的线段（多次迭代直到无法再合并）
-//  5. 统一等值线方向：闭合环按逆时针（CCW）、开线按右手定则（高值在左）
-//  6. 坐标输出前将 [lon, lat] 转换为 [lat, lon] 格式
-func generateLevelLines(cg *contour.Grid, level float64, canvasSize font.Length, boundary orb.Polygon, baseProperties map[string]interface{}) []*geojson.Feature {
+// 处理流程：
+//  1. 使用 gonum/plot 的 NewContour（Marching Squares）在自定义 canvas 上绘制
+//  2. 从 vg.Path 提取坐标并转换回地理空间
+//  3. 合并端点相接的线段
+//  4. 用边界多边形裁剪
+//  5. 过滤过短的线段
+//  6. 统一线段方向（resolveLineOrientationCG）
+//  7. 交换 X/Y 坐标以匹配 orb 库的 (lon, lat) 约定
+func generateLevelLines(grid *Grid, level float64, canvasSize font.Length, boundary orb.Polygon, baseProperties map[string]interface{}) []*geojson.Feature {
 	var features []*geojson.Feature
-	c := plotter.NewContour(cg, []float64{level}, nil)
+	c := plotter.NewContour(grid, []float64{level}, nil)
 	xMin, xMax, yMin, yMax := c.DataRange()
 
-	rc := &contour.Canvas{}
+	rc := &canvas{}
 	dc := draw.Canvas{
 		Canvas: rc,
 		Rectangle: vg.Rectangle{
@@ -415,14 +276,13 @@ func generateLevelLines(cg *contour.Grid, level float64, canvasSize font.Length,
 	p.X.Min, p.X.Max = xMin, xMax
 	p.Y.Min, p.Y.Max = yMin, yMax
 	p.Add(c)
-	// Plot 底层 gonum marches squares 算法使用了包级全局缓冲区，并发调用会数据损坏
+	// 串行化 gonum/plot 的渲染，因其内部不是并发安全的
 	plotMutex.Lock()
 	c.Plot(dc, p)
 	plotMutex.Unlock()
 
-	// 收集所有坐标线
-	var allCoords [][]orb.Point
-	for _, path := range rc.GetPaths() {
+	var allCoords [][]*orb.Point
+	for _, path := range rc.getPaths() {
 		coords := extractCoords(path, xMin, xMax, yMin, yMax, float64(canvasSize))
 		if len(coords) < 2 {
 			continue
@@ -430,73 +290,41 @@ func generateLevelLines(cg *contour.Grid, level float64, canvasSize font.Length,
 		allCoords = append(allCoords, coords)
 	}
 
-	// 用 boundary 裁剪等值线，仅保留边界内部的部分
 	allCoords = clipLinesToPolygon(allCoords, boundary)
 
-	// 合并首尾相连的坐标线（误差 0.001 以内视为相连）
-	tolerance := 0.01
-	merged := mergeConnectedLines(allCoords, tolerance)
-	for {
-		oldLen := len(merged)
-		merged = mergeConnectedLines(merged, tolerance)
-		if len(merged) == oldLen {
-			break
-		}
-	}
-
-	// 计算边界周长，用于过滤过短的线（长度 < 边界周长 × 0.002）
-	minLength := planar.Length(orb.LineString(boundary[0])) * 0.01
+	merged := mergeConnectedLines(allCoords)
+	// 过滤长度小于边界周长 1/100000 的线段
+	minLength := planar.Length(orb.LineString(boundary[0])) * 0.00001
 	for _, coords := range merged {
-		if len(coords) < 2 {
+		if len(coords) < 2 || planar.Length(orb.LineString(toOrbPoints(coords))) < minLength {
 			continue
 		}
-		// 过滤过短线
-		if planar.Length(orb.LineString(coords)) < minLength {
-			continue
-		}
-		// 统一处理等值线方向（右手定则: 高值永远在左侧）
-		// 在坐标转换前处理（使用 [lon, lat] 坐标）
-		isClosed, highSide := resolveLineOrientationCG(cg, coords, level)
 
-		// 等值线内部计算使用 [lon, lat]，输出时转换为 [lat, lon] 与 boundary 对齐
+		isClosed, highSide := resolveLineOrientationCG(grid, coords, level, boundary)
+
+		// 坐标交换 (lon,lat)→(lat,lon)，匹配 orb 输出的 (lat,lon) 约定
+		// 交换 X/Y 后几何方向反转：(lon,lat) 的 CCW 在 (lat,lon) 变为 CW
 		for i := range coords {
 			coords[i][0], coords[i][1] = coords[i][1], coords[i][0]
 		}
 
-		// 坐标交换 [lon,lat] → [lat,lon] 是方向翻转变换，
-		// 对闭合环：交换后 CCW → CW，需再反转回 CCW 以符合右手定则
-		// 对开线：方向翻转，高值侧 left → right
+		// 补偿坐标交换的影响：
+		//   封闭线：CCW→CW，反转恢复 CCW
+		//   开放线：left↔right 翻转
 		if isClosed {
 			reversePoints(coords)
-		} else if highSide == "left" {
-			highSide = "right"
-		}
-
-		// 开线整体走向统一为逆时针（相对于边界多边形）
-		// 使用边界内点判断：内点在走向左侧（cross>0）为 CCW，否则反转
-		if !isClosed {
-			s, e := coords[0], coords[len(coords)-1]
-			rep := representativePoint(boundary)
-			// 在 (x=lon, y=lat) 坐标系下计算叉积
-			dx := e[1] - s[1]   // lon 方向差
-			dy := e[0] - s[0]   // lat 方向差
-			px := rep[1] - s[1] // 内点 lon 差
-			py := rep[0] - s[0] // 内点 lat 差
-			cross := dx*py - dy*px
-			if cross < 0 {
-				reversePoints(coords)
-				if highSide == "left" {
-					highSide = "right"
-				} else {
-					highSide = "left"
-				}
+		} else {
+			if highSide == "left" {
+				highSide = "right"
+			} else {
+				highSide = "left"
 			}
 		}
 
-		ls := orb.LineString(coords)
+		ls := orb.LineString(toOrbPoints(coords))
 		feature := geojson.NewFeature(ls)
 		feature.Properties = maputil.Merge(map[string]interface{}{}, baseProperties)
-		feature.Properties["level"] = math.Round(level*1e2) / 1e2
+		feature.Properties["level"] = math.Round(level*1e4) / 1e4
 		feature.Properties["is_closed"] = isClosed
 		feature.Properties["high_value_side"] = highSide
 		features = append(features, feature)
@@ -504,73 +332,123 @@ func generateLevelLines(cg *contour.Grid, level float64, canvasSize font.Length,
 	return features
 }
 
-// sampleGridCG 在 contour.Grid 中通过双线性插值采样指定坐标 (x, y) 处的值。
-// 坐标系统为 [lon, lat]。若坐标超出网格范围，则取边界值。
-func sampleGridCG(cg *contour.Grid, x, y float64) float64 {
-	cols, rows := cg.Dims()
-	if cols < 2 || rows < 2 {
-		return 0
+// toOrbPoints 将 []*orb.Point 转换为 []orb.Point。
+func toOrbPoints(pts []*orb.Point) []orb.Point {
+	result := make([]orb.Point, len(pts))
+	for i, p := range pts {
+		result[i] = *p
 	}
-
-	j := sort.Search(cols, func(j int) bool { return cg.X(j) >= x })
-	if j >= cols {
-		j = cols - 1
-	}
-	if j > 0 && (j >= cols || x < cg.X(j)) {
-		j--
-	}
-	if j >= cols-1 {
-		j = cols - 2
-	}
-	if j < 0 {
-		j = 0
-	}
-
-	i := sort.Search(rows, func(i int) bool { return cg.Y(i) >= y })
-	if i >= rows {
-		i = rows - 1
-	}
-	if i > 0 && (i >= rows || y < cg.Y(i)) {
-		i--
-	}
-	if i >= rows-1 {
-		i = rows - 2
-	}
-	if i < 0 {
-		i = 0
-	}
-
-	x0, x1 := cg.X(j), cg.X(j+1)
-	y0, y1 := cg.Y(i), cg.Y(i+1)
-	if x1-x0 < 1e-12 || y1-y0 < 1e-12 {
-		return cg.Z(j, i)
-	}
-
-	tx := (x - x0) / (x1 - x0)
-	ty := (y - y0) / (y1 - y0)
-	tx = math.Max(0, math.Min(1, tx))
-	ty = math.Max(0, math.Min(1, ty))
-
-	v00 := cg.Z(j, i)
-	v10 := cg.Z(j+1, i)
-	v01 := cg.Z(j, i+1)
-	v11 := cg.Z(j+1, i+1)
-
-	return (1-tx)*(1-ty)*v00 + tx*(1-ty)*v10 + (1-tx)*ty*v01 + tx*ty*v11
+	return result
 }
 
-// resolveLineOrientationCG 调整等值线方向并确定高值侧。
+// fromOrbPoints 将 []orb.Point 转换为 []*orb.Point。
+func fromOrbPoints(pts []orb.Point) []*orb.Point {
+	result := make([]*orb.Point, len(pts))
+	for i := range pts {
+		result[i] = &orb.Point{pts[i][0], pts[i][1]}
+	}
+	return result
+}
+
+// resolveLineOrientationCG 判断等值线的几何闭合状态及高值侧方向。
 //
-// 对所有线条统一采用右手定则：沿线条走向，高值区始终在左侧。
-// 对于闭合环，确保环为逆时针方向（CCW，有符号面积 > 0），
-// 此时高值侧为 "inside"（中心值高）或 "outside"（中心值低）。
-// 对于开线，通过法线方向的采样值确定方向，使高值在左，高值侧为 "left"。
+// 统一采样逻辑（封闭/非封闭共用）：
 //
-// 注：坐标在 [lon, lat] 系统下处理。
-func resolveLineOrientationCG(cg *contour.Grid, coords []orb.Point, level float64) (isClosed bool, highSide string) {
+//	取多段线中间有向线段的中点，沿左法向（行进方向逆时针90°）偏移微小距离，
+//	采样该点的网格插值。比较采样值与 level 的大小即可得出高值侧。
+//
+// 封闭线：
+//
+//	先确保多边形为 CCW（逆时针 / 左旋），此时有向线段的左侧 = 多边形内部。
+//	左法向采样值 > level → 高值在内部 → "inside"
+//	左法向采样值 ≤ level → 高值在外部 → "outside"
+//
+// 非封闭线：
+//
+//	开线将边界切割成两个子多边形。方向需保证从起点沿开线到终点，
+//	再沿边界左旋（CCW）回到起点所围成的封闭多边形为 CCW。
+//	若该多边形面积 < 0（CW），则反转开线方向。
+//	左法向采样值 > level → 高值在左侧 → "left"
+//	左法向采样值 ≤ level → 高值在右侧 → "right"
+//
+// 注意：调用方在 (lon,lat)→(lat,lon) 坐标交换后需对 highSide 做翻转补偿。
+func resolveLineOrientationCG(grid *Grid, coords []*orb.Point, level float64, boundary orb.Polygon) (isClosed bool, highSide string) {
 	closed := isLineClosed(coords, 0.01)
+
 	if closed {
-		n := len(coords)
+		// 封闭线：确保 CCW（左旋），使有向线段的左侧指向多边形内部
+		if planar.Area(orb.Ring(toOrbPoints(coords))) < 0 {
+			reversePoints(coords)
+		}
+	} else if len(boundary) > 0 && len(boundary[0]) >= 3 {
+		// 非封闭线：通过构造 (开线 + 边界段) 的封闭多边形来判断方向
+		// 开线方向需使得 起点→终点→边界左旋→起点 围成的多边形为 CCW
+		ring := boundary[0]
+		startPt := *coords[0]
+		endPt := *coords[len(coords)-1]
+
+		// 找起终点在边界环上的最近段
+		si := closestRingSegment(startPt, ring)
+		ei := closestRingSegment(endPt, ring)
+
+		// 沿边界环从终点左旋（CCW）回到起点，构建边界段
+		var ringPts []orb.Point
+		if si == ei {
+			// 起终点在同一段上，直接用开线本身构成闭合环来判方向
+			// （开线两端 + 沿边界同一段回到起点）
+			ringPts = append(ringPts, endPt)
+			for j := ei; j != si; j = (j + 1) % (len(ring) - 1) {
+				ringPts = append(ringPts, ring[j])
+			}
+			ringPts = append(ringPts, startPt)
+		} else {
+			// 从终点段末 → 沿环到起点段首
+			for j := ei; j != si; j = (j + 1) % (len(ring) - 1) {
+				ringPts = append(ringPts, ring[j])
+			}
+			ringPts = append(ringPts, ring[si])
+		}
+
+		// 构建封闭多边形：开线坐标 + 边界段
+		polyPts := make([]orb.Point, 0, len(coords)+len(ringPts))
+		for _, p := range coords {
+			polyPts = append(polyPts, *p)
+		}
+		polyPts = append(polyPts, ringPts...)
+		// 确保闭合
+		if !utils.EqPoint(polyPts[0], polyPts[len(polyPts)-1], 1e-9) {
+			polyPts = append(polyPts, polyPts[0])
+		}
+
+		if planar.Area(orb.Ring(polyPts)) < 0 {
+			reversePoints(coords)
+		}
+	}
+
+	// 多点采样：在多段线的多个位置沿左法向采样，多数投票决定高值侧。
+	// 避免单点采样因局部异常导致误判。
+	highSide = sampleHighSide(grid, coords, level, closed)
+	return closed, highSide
+}
+
+// sampleHighSide 采样网格值，多数投票判断高值侧。
+//
+// 封闭线：优先用质心采样（最稳定），若质心在多边形外（极度凹多边形），
+//
+//	则退化为沿多段线左法向多点采样（CCW 封闭线左侧=内部）。
+//
+// 非封闭线：沿多段线多点左法向采样，过半则为 "left"，否则 "right"。
+func sampleHighSide(grid *Grid, coords []*orb.Point, level float64, closed bool) string {
+	n := len(coords)
+	if n < 2 {
+		if closed {
+			return "inside"
+		}
+		return "left"
+	}
+
+	if closed {
+		// 质心采样（最可靠的方式）
 		cx, cy := 0.0, 0.0
 		for i := 0; i < n; i++ {
 			cx += coords[i][0]
@@ -578,171 +456,398 @@ func resolveLineOrientationCG(cg *contour.Grid, coords []orb.Point, level float6
 		}
 		cx /= float64(n)
 		cy /= float64(n)
-		centerVal := sampleGridCG(cg, cx, cy)
-		area := signedRingArea(coords)
 
-		// 统一调整为逆时针方向（CCW，area > 0）
-		if area < 0 {
-			reversePoints(coords)
+		ring := orb.Ring(toOrbPoints(coords))
+		if planar.PolygonContains(orb.Polygon{ring}, orb.Point{cx, cy}) {
+			if grid.Sample(cx, cy) > level {
+				return "inside"
+			}
+			return "outside"
 		}
-		// 根据中心值与 level 的关系确定高值侧
-		if centerVal > level {
-			return true, "inside"
+		// 质心在外（极度凹多边形），退化为边缘采样
+	}
+
+	// 多点边缘采样：取 numSamples 条均匀线段，中点沿左法向偏移采样，多数投票
+	numSamples := 5
+	if n-1 < numSamples {
+		numSamples = n - 1
+	}
+	if numSamples < 1 {
+		numSamples = 1
+	}
+
+	stepSize := float64(n-1) / float64(numSamples)
+	countHigh := 0
+	countValid := 0
+
+	for i := 0; i < numSamples; i++ {
+		idx := int(float64(i) * stepSize)
+		if idx >= n-1 {
+			idx = n - 2
 		}
-		return true, "outside"
+		a, b := coords[idx], coords[idx+1]
+		dx := b[0] - a[0] // Δlon
+		dy := b[1] - a[1] // Δlat
+
+		segLen := math.Hypot(dx, dy)
+		if segLen < 1e-9 {
+			continue
+		}
+
+		// 中点沿左法向 (-dy, dx) 偏移后采样
+		mx := (a[0] + b[0]) / 2
+		my := (a[1] + b[1]) / 2
+		step := 0.1
+		val := grid.Sample(mx-dy*step, my+dx*step)
+
+		countValid++
+		if val > level {
+			countHigh++
+		}
 	}
 
-	if len(coords) < 2 {
-		return false, "left"
-	}
-	mid := len(coords) / 2
-	a, b := coords[mid], coords[(mid+1)%len(coords)]
-	dx := b[0] - a[0]
-	dy := b[1] - a[1]
-	if math.Abs(dx) < 1e-9 && math.Abs(dy) < 1e-9 {
-		return false, "left"
+	if countValid == 0 {
+		if closed {
+			return "inside"
+		}
+		return "left"
 	}
 
-	mx := (a[0] + b[0]) / 2
-	my := (a[1] + b[1]) / 2
-	step := 0.001
-	leftVal := sampleGridCG(cg, mx-dy*step, my+dx*step)
-	rightVal := sampleGridCG(cg, mx+dy*step, my-dx*step)
-
-	// 若右侧值大于左侧，说明当前走向高值在右，反转以保持高值在左
-	if rightVal > leftVal {
-		reversePoints(coords)
+	if countHigh > countValid/2 {
+		if closed {
+			return "inside"
+		}
+		return "left"
 	}
-	return false, "left"
+	if closed {
+		return "outside"
+	}
+	return "right"
 }
 
-// eqPoint 判断两点是否近似相等，当欧氏距离 <= tolerance 时视为相等。
-func eqPoint(a, b orb.Point, tolerance float64) bool {
-	return math.Hypot(a[0]-b[0], a[1]-b[1]) <= tolerance
+// closestRingSegment 找到点 pt 在环 ring 上最近的段索引。
+// 返回段起点在环中的索引。
+func closestRingSegment(pt orb.Point, ring orb.Ring) int {
+	minDist := math.MaxFloat64
+	minIdx := 0
+	for i := 0; i < len(ring)-1; i++ {
+		cp := closestPointOnSegment(pt, ring[i], ring[i+1])
+		d := (cp[0]-pt[0])*(cp[0]-pt[0]) + (cp[1]-pt[1])*(cp[1]-pt[1])
+		if d < minDist {
+			minDist = d
+			minIdx = i
+		}
+	}
+	return minIdx
 }
 
-// reversePoints 原地反转点序列（双指针法，O(n/2)）。
-func reversePoints(pts []orb.Point) {
+// reversePoints 原地反转点序列。
+func reversePoints(pts []*orb.Point) {
 	for i, j := 0, len(pts)-1; i < j; i, j = i+1, j-1 {
 		pts[i], pts[j] = pts[j], pts[i]
 	}
 }
 
-// mergeConnectedLines 合并首尾相连的坐标线为更长的连续线段。
-// 对每条未使用的线，与已有结果线逐一比较四种连接方式（首-首、尾-首、首-尾、尾-尾），
-// 若匹配则合并，否则作为新线追加。tolerance 为判定两点相连的距离阈值。
-func mergeConnectedLines(lines [][]orb.Point, tolerance float64) [][]orb.Point {
+// mergeConnectedLines 合并端点相接的线段。
+//
+// 使用空间哈希（cell grid）加速邻近搜索：
+//  1. 将每条线的首尾端点映射到空间格网
+//  2. 在同一格网及相邻格网内寻找距离在 tolerance 内的端点对
+//  3. 使用并查集（Union-Find）将属于同一线段组的线索引合并
+//  4. 对每个连通分量调用 rebuildChain 重建有序线段链
+func mergeConnectedLines(lines [][]*orb.Point) [][]*orb.Point {
 	if len(lines) <= 1 {
 		return lines
 	}
-	var newLines [][]orb.Point
-	newLines = append(newLines, lines[0])
-	unUsedLines := lines[1:]
-	for len(unUsedLines) > 0 {
-		curLine := unUsedLines[0]
-		unUsedLines = unUsedLines[1:]
-		used := false
-		for idx := 0; idx < len(newLines); idx++ {
-			//首首点相同
-			if eqPoint(newLines[idx][0], curLine[0], tolerance) {
-				reversePoints(curLine)
-				newLines[idx] = append(curLine, newLines[idx][1:]...)
-				used = true
-				break
+
+	n := len(lines)
+	cellSize := tolerance
+
+	type epEntry struct {
+		idx    int
+		isHead bool
+	}
+
+	epMap := make(map[string][]epEntry)
+	addToCells := func(pt *orb.Point, entry epEntry) {
+		cx := int(math.Floor(pt[0] / cellSize))
+		cy := int(math.Floor(pt[1] / cellSize))
+		for dx := -1; dx <= 1; dx++ {
+			for dy := -1; dy <= 1; dy++ {
+				k := fmt.Sprintf("%d,%d", cx+dx, cy+dy)
+				epMap[k] = append(epMap[k], entry)
 			}
-			//尾首点相同
-			if eqPoint(newLines[idx][len(newLines[idx])-1], curLine[0], tolerance) {
-				newLines[idx] = append(newLines[idx], curLine[1:]...)
-				used = true
-				break
-			}
-			//首尾点相同
-			if eqPoint(newLines[idx][0], curLine[len(curLine)-1], tolerance) {
-				newLines[idx] = append(curLine, newLines[idx][1:]...)
-				used = true
-				break
-			}
-			//	尾尾点相同
-			if eqPoint(newLines[idx][len(newLines[idx])-1], curLine[len(curLine)-1], tolerance) {
-				reversePoints(curLine)
-				newLines[idx] = append(newLines[idx], curLine[1:]...)
-				used = true
-				break
-			}
-		}
-		if !used {
-			newLines = append(newLines, curLine)
 		}
 	}
-	return newLines
+
+	for i, line := range lines {
+		if len(line) < 2 {
+			continue
+		}
+		addToCells(line[0], epEntry{i, true})
+		addToCells(line[len(line)-1], epEntry{i, false})
+	}
+
+	// 并查集
+	parent := make([]int, n)
+	for i := range parent {
+		parent[i] = i
+	}
+	find := func(x int) int {
+		root := x
+		for parent[root] != root {
+			root = parent[root]
+		}
+		for parent[x] != root {
+			parent[x], x = root, parent[x]
+		}
+		return root
+	}
+
+	seen := make(map[[2]int]bool)
+	for _, entries := range epMap {
+		for i := 0; i < len(entries); i++ {
+			for j := i + 1; j < len(entries); j++ {
+				ea, eb := entries[i], entries[j]
+				if ea.idx == eb.idx {
+					continue
+				}
+				a, b := ea.idx, eb.idx
+				if a > b {
+					a, b = b, a
+				}
+				pair := [2]int{a, b}
+				if seen[pair] {
+					continue
+				}
+				seen[pair] = true
+
+				var pa, pb *orb.Point
+				if ea.isHead {
+					pa = lines[ea.idx][0]
+				} else {
+					pa = lines[ea.idx][len(lines[ea.idx])-1]
+				}
+				if eb.isHead {
+					pb = lines[eb.idx][0]
+				} else {
+					pb = lines[eb.idx][len(lines[eb.idx])-1]
+				}
+				if utils.EqPoint(*pa, *pb, tolerance) {
+					ra, rb := find(ea.idx), find(eb.idx)
+					if ra != rb {
+						parent[ra] = rb
+					}
+				}
+			}
+		}
+	}
+
+	compMap := make(map[int][]int)
+	for i := 0; i < n; i++ {
+		if len(lines[i]) < 2 {
+			continue
+		}
+		root := find(i)
+		compMap[root] = append(compMap[root], i)
+	}
+
+	var result [][]*orb.Point
+	for _, indices := range compMap {
+		merged := rebuildChain(lines, indices)
+		result = append(result, merged...)
+	}
+
+	return result
 }
 
-// clipLinesToPolygon 用 boundary 多边形裁剪所有等值线，保留边界内部的部分。
-// 注意: boundary 原始坐标顺序为 [lat, lon]，内部会统一转换为 [lon, lat] 与等值线坐标对齐。
-func clipLinesToPolygon(lines [][]orb.Point, boundary orb.Polygon) [][]orb.Point {
-	// boundary 原始为 [lat, lon]，转换为 [lon, lat] 与等值线坐标对齐
+// rebuildChain 将属于同一组的线段片段重建为有序的线段链。
+//
+// 首先匹配各片段的头尾连接关系，然后从度数为 1 的端点（或闭合环的任意点）出发，
+// 按连接关系依次拼接，最终输出一条或多条连续线段。
+func rebuildChain(lines [][]*orb.Point, indices []int) [][]*orb.Point {
+	if len(indices) == 1 {
+		return [][]*orb.Point{lines[indices[0]]}
+	}
+
+	m := len(indices)
+	idxToPos := make(map[int]int, m)
+	posToIdx := make([]int, m)
+	for pos, idx := range indices {
+		idxToPos[idx] = pos
+		posToIdx[pos] = idx
+	}
+
+	type conn struct {
+		toPos  int
+		toHead bool
+	}
+	headConn := make([]*conn, m)
+	tailConn := make([]*conn, m)
+
+	for a := 0; a < m; a++ {
+		la := lines[posToIdx[a]]
+		for b := a + 1; b < m; b++ {
+			lb := lines[posToIdx[b]]
+
+			if utils.EqPoint(*la[0], *lb[0], tolerance) {
+				headConn[a] = &conn{b, true}
+				headConn[b] = &conn{a, true}
+			}
+			if utils.EqPoint(*la[0], *lb[len(lb)-1], tolerance) {
+				headConn[a] = &conn{b, false}
+				tailConn[b] = &conn{a, true}
+			}
+			if utils.EqPoint(*la[len(la)-1], *lb[0], tolerance) {
+				tailConn[a] = &conn{b, true}
+				headConn[b] = &conn{a, false}
+			}
+			if utils.EqPoint(*la[len(la)-1], *lb[len(lb)-1], tolerance) {
+				tailConn[a] = &conn{b, false}
+				tailConn[b] = &conn{a, false}
+			}
+		}
+	}
+
+	degree := make([]int, m)
+	for i := 0; i < m; i++ {
+		if headConn[i] != nil {
+			degree[i]++
+		}
+		if tailConn[i] != nil {
+			degree[i]++
+		}
+	}
+
+	visited := make([]bool, m)
+	var result [][]*orb.Point
+
+	for {
+		// 优先从度数为 1 的端点开始（开放链的起点）
+		start := -1
+		startFromHead := true
+		for i := 0; i < m; i++ {
+			if visited[i] {
+				continue
+			}
+			if degree[i] == 1 {
+				start = i
+				startFromHead = headConn[i] == nil
+				break
+			}
+		}
+		// 若无度数为 1 的端点，任选一个未访问的片段（闭合环）
+		if start == -1 {
+			for i := 0; i < m; i++ {
+				if !visited[i] {
+					start = i
+					startFromHead = true
+					break
+				}
+			}
+			if start == -1 {
+				break
+			}
+		}
+
+		var chain []*orb.Point
+		cur := start
+		forward := startFromHead
+
+		for {
+			visited[cur] = true
+			line := lines[posToIdx[cur]]
+
+			if forward {
+				chain = append(chain, line...)
+			} else {
+				for i := len(line) - 1; i >= 0; i-- {
+					chain = append(chain, line[i])
+				}
+			}
+
+			var next *conn
+			if forward {
+				next = tailConn[cur]
+			} else {
+				next = headConn[cur]
+			}
+			if next == nil || visited[next.toPos] {
+				break
+			}
+
+			forward = next.toHead
+			cur = next.toPos
+		}
+
+		if len(chain) >= 2 {
+			result = append(result, chain)
+		}
+	}
+
+	return result
+}
+
+// clipLinesToPolygon 用边界多边形裁剪所有等值线段。
+// 先将边界多边形做坐标交换（(lat,lon)→(lon,lat)），再逐条裁剪。
+func clipLinesToPolygon(lines [][]*orb.Point, boundary orb.Polygon) [][]*orb.Point {
 	normPoly := make(orb.Polygon, len(boundary))
 	for ri, ring := range boundary {
 		normRing := make(orb.Ring, len(ring))
 		for i, p := range ring {
-			normRing[i] = orb.Point{p[1], p[0]} // [lat, lon] -> [lon, lat]
+			normRing[i] = orb.Point{p[1], p[0]}
 		}
 		normPoly[ri] = normRing
 	}
 
-	var result [][]orb.Point
+	var result [][]*orb.Point
 	for _, line := range lines {
-		clipped := clipLineToPolygon(line, normPoly)
-		result = append(result, clipped...)
+		result = append(result, clipLineToPolygon(line, normPoly)...)
 	}
 	return result
 }
 
-// clipLineToPolygon 将单条线裁剪到 polygon 内部（均使用 [lon, lat] 坐标系）。
+// clipLineToPolygon 使用 Sutherland–Hodgman 风格算法裁剪单条线段。
 //
-// 使用 planar.PolygonContains 判断点是否在边界内，对跨越边界的线段计算交点。
-// 处理四种情况：
-//   - 两点都在内部：直接添加
-//   - 从内到外：找到出交点，截断当前段
-//   - 从外到内：找到入交点，开始新段
-//   - 两点都在外部：检查线段是否穿越多边形内部
-func clipLineToPolygon(line []orb.Point, boundary orb.Polygon) [][]orb.Point {
+// 对线段上的每对连续点，根据其在多边形内/外的状态分 4 种情况处理：
+//   - 内→内：保留终点
+//   - 内→外：找交点，添加到当前段，结束该段
+//   - 外→内：找交点，开始新段
+//   - 外→外：可能跨越整个多边形，找两个交点生成穿越段
+func clipLineToPolygon(line []*orb.Point, boundary orb.Polygon) [][]*orb.Point {
 	if len(line) < 2 {
 		return nil
 	}
-
 	ring := boundary[0]
-	var result [][]orb.Point
-	var current []orb.Point
+	var result [][]*orb.Point
+	var current []*orb.Point
 
-	prevIn := planar.PolygonContains(boundary, line[0])
+	prevIn := planar.PolygonContains(boundary, *line[0])
 	if prevIn {
 		current = append(current, line[0])
 	}
-
 	for i := 1; i < len(line); i++ {
-		currIn := planar.PolygonContains(boundary, line[i])
-
+		currIn := planar.PolygonContains(boundary, *line[i])
 		if prevIn && currIn {
-			// 两点都在内部，直接添加
 			current = append(current, line[i])
 		} else if prevIn && !currIn {
-			// 从内部走向外部，找到出交点
-			pt := lineRingFirstIntersection(line[i-1], line[i], ring)
-			current = append(current, pt)
+			if pt, ok := lineRingFirstIntersection(*line[i-1], *line[i], ring); ok {
+				current = append(current, &pt)
+			}
 			if len(current) >= 2 {
 				result = append(result, current)
 			}
 			current = nil
 		} else if !prevIn && currIn {
-			// 从外部走向内部，找到入交点
-			pt := lineRingFirstIntersection(line[i-1], line[i], ring)
-			current = []orb.Point{pt, line[i]}
+			if pt, ok := lineRingFirstIntersection(*line[i-1], *line[i], ring); ok {
+				current = []*orb.Point{&pt, line[i]}
+			} else {
+				current = []*orb.Point{line[i]}
+			}
 		} else {
-			// 两点都在外部，检查线段是否穿越多边形内部
-			crossPts := linePolygonCrossings(line[i-1], line[i], ring)
+			crossPts := linePolygonCrossings(*line[i-1], *line[i], ring)
 			if len(crossPts) == 2 {
-				result = append(result, []orb.Point{crossPts[0], crossPts[1]})
+				result = append(result, []*orb.Point{crossPts[0], crossPts[1]})
 			}
 		}
 
@@ -756,9 +861,9 @@ func clipLineToPolygon(line []orb.Point, boundary orb.Polygon) [][]orb.Point {
 	return result
 }
 
-// lineRingFirstIntersection 返回线段 a-b 与环 ring 各边的第一个交点（沿线段方向距 a 最近的交点）。
-// 若未找到精确交点，则将 a 点吸附到环上的最近点作为退化处理。
-func lineRingFirstIntersection(a, b orb.Point, ring orb.Ring) orb.Point {
+// lineRingFirstIntersection 找线段与多边形环的最近交点（从线段起点 a 方向出发）。
+// 返回距离 a 最近的交点和是否找到。
+func lineRingFirstIntersection(a, b orb.Point, ring orb.Ring) (orb.Point, bool) {
 	var bestPt orb.Point
 	bestDist := math.MaxFloat64
 	found := false
@@ -775,30 +880,10 @@ func lineRingFirstIntersection(a, b orb.Point, ring orb.Ring) orb.Point {
 		}
 	}
 
-	if !found {
-		// 退化情况：未找到精确交点，将 a 点 snap 到环上最近点
-		return snapPointToRing(a, ring)
-	}
-	return bestPt
+	return bestPt, found
 }
 
-// snapPointToRing 将点吸附（投影）到环的最近点上，返回环上的最近点坐标。
-func snapPointToRing(pt orb.Point, ring orb.Ring) orb.Point {
-	var best orb.Point
-	bestD := math.MaxFloat64
-	for i := 0; i < len(ring)-1; i++ {
-		proj := closestPointOnSegment(pt, ring[i], ring[i+1])
-		d := (pt[0]-proj[0])*(pt[0]-proj[0]) + (pt[1]-proj[1])*(pt[1]-proj[1])
-		if d < bestD {
-			bestD = d
-			best = proj
-		}
-	}
-	return best
-}
-
-// closestPointOnSegment 计算点 p 在线段 a-b 上的最近投影点。
-// t 参数被钳制到 [0, 1] 区间内。
+// closestPointOnSegment 计算点 p 到线段 ab 上的最近点（垂足或端点）。
 func closestPointOnSegment(p, a, b orb.Point) orb.Point {
 	dx, dy := b[0]-a[0], b[1]-a[1]
 	lenSq := dx*dx + dy*dy
@@ -814,11 +899,11 @@ func closestPointOnSegment(p, a, b orb.Point) orb.Point {
 	return orb.Point{a[0] + t*dx, a[1] + t*dy}
 }
 
-// linePolygonCrossings 返回线段 a-b 与环 ring 的所有交点，当 a、b 两点都在多边形外部且线段穿越内部时使用。
-// 交点按距离 a 的远近排序，返回最近的两个不重复交点（构成穿入穿出对）。
-func linePolygonCrossings(a, b orb.Point, ring orb.Ring) []orb.Point {
+// linePolygonCrossings 找线段 ab 与多边形环的所有交点，返回最近的 2 个不同交点。
+// 用于处理线段完全位于多边形外部但跨越整个多边形的情况。
+func linePolygonCrossings(a, b orb.Point, ring orb.Ring) []*orb.Point {
 	type ptDist struct {
-		pt   orb.Point
+		pt   *orb.Point
 		dist float64
 	}
 	var crossings []ptDist
@@ -827,7 +912,7 @@ func linePolygonCrossings(a, b orb.Point, ring orb.Ring) []orb.Point {
 		pt, ok := segmentIntersection(a, b, ring[i], ring[i+1])
 		if ok {
 			d := (pt[0]-a[0])*(pt[0]-a[0]) + (pt[1]-a[1])*(pt[1]-a[1])
-			crossings = append(crossings, ptDist{pt, d})
+			crossings = append(crossings, ptDist{&orb.Point{pt[0], pt[1]}, d})
 		}
 	}
 
@@ -835,13 +920,11 @@ func linePolygonCrossings(a, b orb.Point, ring orb.Ring) []orb.Point {
 		return nil
 	}
 
-	// 按距 a 的距离排序，取前两个（最近的两个交点）
 	sort.Slice(crossings, func(i, j int) bool {
 		return crossings[i].dist < crossings[j].dist
 	})
 
-	var result []orb.Point
-	// 合并距离很近的交点（容差）
+	var result []*orb.Point
 	for i := 0; i < len(crossings); i++ {
 		if len(result) == 0 {
 			result = append(result, crossings[i].pt)
@@ -864,9 +947,8 @@ func linePolygonCrossings(a, b orb.Point, ring orb.Ring) []orb.Point {
 	return result
 }
 
-// segmentIntersection 计算两条线段 p1-p2 和 p3-p4 的交点。
-// 使用参数方程求解，t 和 u 分别表示交点在各线段上的参数位置。
-// 返回 (交点, true) 如果线段相交（含端点容差），否则返回 (空点, false)。
+// segmentIntersection 使用参数法计算两条线段的交点。
+// 返回交点和是否相交（参数 t, u 均在 [−1e-12, 1+1e-12] 范围内）。
 func segmentIntersection(p1, p2, p3, p4 orb.Point) (orb.Point, bool) {
 	denom := (p1[0]-p2[0])*(p3[1]-p4[1]) - (p1[1]-p2[1])*(p3[0]-p4[0])
 	if math.Abs(denom) < 1e-15 {
@@ -882,114 +964,10 @@ func segmentIntersection(p1, p2, p3, p4 orb.Point) (orb.Point, bool) {
 	return orb.Point{}, false
 }
 
-// isLineClosed 判断等值线是否闭合。
-// 当坐标点数 >= 3 且首尾点距离 < tol 时视为闭合。
-func isLineClosed(coords []orb.Point, tol float64) bool {
+// isLineClosed 判断线段是否闭合（首尾点距离在容差范围内且点数 >= 3）。
+func isLineClosed(coords []*orb.Point, tol float64) bool {
 	if len(coords) < 3 {
 		return false
 	}
-	return eqPoint(coords[0], coords[len(coords)-1], tol)
-}
-
-// signedRingArea 使用鞋带公式（Shoelace formula）计算环的有符号面积。
-// 正值为逆时针（CCW），负值为顺时针（CW）。
-// 不含首尾重复点，通过取模实现闭合计算。
-func signedRingArea(coords []orb.Point) float64 {
-	if len(coords) < 3 {
-		return 0
-	}
-	sum := 0.0
-	for i := 0; i < len(coords); i++ {
-		j := (i + 1) % len(coords)
-		sum += coords[i][0]*coords[j][1] - coords[j][0]*coords[i][1]
-	}
-	return sum * 0.5
-}
-
-// renderContourImage 将克里金网格渲染为热力图，并叠加黑色等值线，输出为 PNG 图片。
-// 图像尺寸固定为 1600×1200 像素，热力图使用蓝→青→绿→黄→红的渐变色带。
-func renderContourImage(cg *contour.Grid, levels []float64, path string) {
-	cols, rows := cg.Dims()
-	if cols < 2 || rows < 2 {
-		return
-	}
-
-	imgW, imgH := 1600, 1200
-
-	xMin, xMax := cg.X(0), cg.X(cols-1)
-	yMin, yMax := cg.Y(0), cg.Y(rows-1)
-	if xMin > xMax {
-		xMin, xMax = xMax, xMin
-	}
-	if yMin > yMax {
-		yMin, yMax = yMax, yMin
-	}
-
-	// 生成热力图色板（256阶）
-	heatColors := make([]color.Color, 256)
-	for i := 0; i < 256; i++ {
-		heatColors[i] = heatColorRGBA(float64(i) / 255.0)
-	}
-
-	p := plot.New()
-	p.X.Min, p.X.Max = xMin, xMax
-	p.Y.Min, p.Y.Max = yMin, yMax
-
-	// 底图：热力图（所有像素着色）
-	p.Add(plotter.NewHeatMap(cg, heatPalette(heatColors)))
-
-	// 叠加：黑色等值线
-	for _, lv := range levels {
-		p.Add(plotter.NewContour(cg, []float64{lv}, nil))
-	}
-
-	// 渲染到同一画布
-	c := vgimg.New(vg.Length(imgW), vg.Length(imgH))
-	dc := draw.New(c)
-	p.Draw(dc)
-
-	f, err := os.Create(path)
-	if err != nil {
-		defaultLogger.Error("renderContourImage 创建文件失败: %v", err)
-		return
-	}
-	defer f.Close()
-	if err := png.Encode(f, c.Image()); err != nil {
-		defaultLogger.Error("renderContourImage 编码图片失败: %v", err)
-		return
-	}
-}
-
-// heatPalette 简单调色板类型，实现 plot.Palette 接口的 Colors() 方法。
-type heatPalette []color.Color
-
-func (p heatPalette) Colors() []color.Color { return p }
-
-// heatColorRGBA 返回蓝→青→绿→黄→红渐变色带的 RGBA 颜色值。
-// t 取值范围 [0, 1]：
-//   - 0.00-0.25: 蓝 → 青
-//   - 0.25-0.50: 青 → 绿
-//   - 0.50-0.75: 绿 → 黄
-//   - 0.75-1.00: 黄 → 红
-func heatColorRGBA(t float64) color.RGBA {
-	t = math.Max(0, math.Min(1, t))
-	var r, g, b uint8
-	if t < 0.25 {
-		s := t / 0.25
-		b = 255
-		g = uint8(255 * s)
-	} else if t < 0.5 {
-		s := (t - 0.25) / 0.25
-		g = 255
-		b = uint8(255 * (1 - s))
-	} else if t < 0.75 {
-		s := (t - 0.5) / 0.25
-		g = 255
-		r = uint8(255 * s)
-	} else {
-		s := (t - 0.75) / 0.25
-		r = 255
-		g = uint8(255 * (1 - s))
-	}
-	return color.RGBA{r, g, b, 255}
+	return utils.EqPoint(*coords[0], *coords[len(coords)-1], tol)
 }

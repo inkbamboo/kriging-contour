@@ -3,74 +3,67 @@ package kriging
 import (
 	"fmt"
 	"math"
-	"runtime"
-	"sync"
 
 	"github.com/inkbamboo/kriging-contour/internal/utils"
-	"github.com/panjf2000/ants/v2"
 	"gonum.org/v1/gonum/mat"
 )
 
-// ============================================================
-//  数据结构
-// ============================================================
-
-// OrdinaryKriging 提供 2D 普通克里金插值。
+// OrdinaryKriging 实现普通克里金（Ordinary Kriging）插值算法。
 //
-// 参考:
-//   [1] P.K. Kitanidis, Introduction to Geostatistics, Cambridge University Press, 1997.
-//   [2] N. Cressie, Statistics for Spatial Data, Wiley, 1993.
+// 普通克里金是一种空间插值方法，基于变差函数模型对未知点的值进行最优无偏估计。
+// 该结构体保存了原始/调整后的数据坐标、变差函数模型及其参数、以及模型质量统计信息。
 type OrdinaryKriging struct {
 	XOrig []float64 // 原始 X 坐标
 	YOrig []float64 // 原始 Y 坐标
 	Z     []float64 // 观测值
 
-	XAdjusted []float64 // 各向异性调整后的 X
-	YAdjusted []float64 // 各向异性调整后的 Y
+	XAdjusted []float64 // 各向异性调整后的 X 坐标
+	YAdjusted []float64 // 各向异性调整后的 Y 坐标
 
-	XCenter           float64 // 中心 X
-	YCenter           float64 // 中心 Y
-	AnisotropyScaling float64 // 各向异性缩放
-	AnisotropyAngle   float64 // 各向异性角度（度）
+	XCenter           float64 // 坐标中心 X（用于各向异性调整）
+	YCenter           float64 // 坐标中心 Y
+	AnisotropyScaling float64 // 各向异性缩放因子
+	AnisotropyAngle   float64 // 各向异性旋转角度（度）
 
-	CoordinatesType string // "euclidean" 或 "geographic"
+	CoordinatesType string // 坐标类型："euclidean" 或 "geographic"
 
-	VariogramModel           string        // 模型名称
-	VariogramFunc            VariogramFunc // 模型函数
-	VariogramModelParameters []float64     // 拟合后参数
+	VariogramModel           string        // 变差函数模型名称
+	VariogramFunc            VariogramFunc // 变差函数
+	VariogramModelParameters []float64     // 模型参数
 
-	Lags         []float64 // 实验变异函数 lags
-	Semivariance []float64 // 实验变异函数 semivariance
+	Lags         []float64 // 实验变差函数的距离滞后
+	Semivariance []float64 // 实验变差函数的半方差
 
-	Delta   []float64 // 拟合统计: delta
-	Sigma   []float64 // 拟合统计: sigma
-	Epsilon []float64 // 拟合统计: epsilon
+	Delta   []float64 // 留一交叉验证的预测误差
+	Sigma   []float64 // 留一交叉验证的标准差
+	Epsilon []float64 // 标准化残差 (delta/sigma)
 	Q1      float64   // Q1 统计量
 	Q2      float64   // Q2 统计量
-	CR      float64   // cR 统计量
+	CR      float64   // cR 准则
 
-	Verbose     bool // 是否输出进度信息
-	ExactValues bool // 是否在输入位置精确插值
-	PseudoInv   bool // 是否使用伪逆
+	Verbose     bool // 是否输出详细日志
+	ExactValues bool // 是否在重合点处返回精确值
+	PseudoInv   bool // 是否使用伪逆而非高斯消元
 }
 
-// OKConfig 创建 OrdinaryKriging 实例的配置。
+// OKConfig 定义创建 OrdinaryKriging 实例的配置参数。
 type OKConfig struct {
-	VariogramModel      string        // 变异函数模型名称，默认 "linear"
-	VariogramParameters interface{}   // 用户指定参数，nil 则自动拟合
-	VariogramFunction   VariogramFunc // custom 模型时必须指定
-	NLags               int           // 半方差图分箱数，默认 6
-	Weight              bool          // 拟合时是否对近距 lag 加权
-	AnisotropyScaling   float64       // 各向异性缩放，默认 1.0
-	AnisotropyAngle     float64       // 各向异性角度（度，CCW），默认 0
-	Verbose             bool          // 是否输出进度
-	EnableStatistics    bool          // 是否计算 Q1/Q2/cR 统计量
-	CoordinatesType     string        // "euclidean" 或 "geographic"，默认 "euclidean"
-	ExactValues         bool          // 是否精确插值输入点（忽略 nugget），默认 true
-	PseudoInv           bool          // 是否用 SVD 伪逆求解
+	VariogramModel      string         // 变差函数模型名称
+	VariogramParameters interface{}    // 模型参数（[]float64 或 map[string]float64）
+	VariogramFunction   VariogramFunc  // 自定义变差函数（仅 model="custom" 时有效）
+	NLags               int            // 实验变差函数的分箱数
+	Weight              bool           // 是否在拟合中使用加权残差
+	AnisotropyScaling   float64        // 各向异性缩放因子（默认 1.0）
+	AnisotropyAngle     float64        // 各向异性旋转角度（度）
+	Verbose             bool           // 是否输出详细日志
+	EnableStatistics    bool           // 是否计算模型质量统计
+	CoordinatesType     string         // 坐标类型："euclidean" 或 "geographic"
+	ExactValues         bool           // 是否在重合点处返回精确值
+	PseudoInv           bool           // 是否使用伪逆
 }
 
-// DefaultOKConfig 返回带有合理默认值的 OKConfig。
+// DefaultOKConfig 返回默认的 OK 配置。
+// 默认使用线性变差函数模型、欧几里得坐标、6 个分箱、启用精确值。
 func DefaultOKConfig() OKConfig {
 	return OKConfig{
 		VariogramModel:    "linear",
@@ -81,35 +74,35 @@ func DefaultOKConfig() OKConfig {
 	}
 }
 
-// ============================================================
-//  构造函数
-// ============================================================
-
-// NewOrdinaryKriging 创建一个新的 OrdinaryKriging 实例。
+// NewOrdinaryKriging 创建并初始化一个 Ordinary Kriging 插值器。
+//
+// 初始化流程：
+//  1. 验证输入数据的有效性
+//  2. 设置变差函数模型
+//  3. 应用各向异性调整
+//  4. 初始化和拟合变差函数
+//  5. 可选计算模型质量统计
 func NewOrdinaryKriging(x, y, z []float64, cfg OKConfig) (*OrdinaryKriging, error) {
 	if err := validateInputs(x, y, z, cfg); err != nil {
 		return nil, err
 	}
 
 	ok := &OrdinaryKriging{
-		XOrig:           copySlice(x),
-		YOrig:           copySlice(y),
-		Z:               copySlice(z),
 		ExactValues:     cfg.ExactValues,
 		PseudoInv:       cfg.PseudoInv,
 		CoordinatesType: cfg.CoordinatesType,
 		Verbose:         cfg.Verbose,
 	}
+	ok.XOrig = append([]float64{}, x...)
+	ok.YOrig = append([]float64{}, y...)
+	ok.Z = append([]float64{}, z...)
 
-	// 设置变异函数模型
 	if err := ok.setupVariogramModel(cfg); err != nil {
 		return nil, err
 	}
 
-	// 处理各向异性
 	ok.setupAnisotropy(cfg)
 
-	// 初始化变异函数
 	if ok.Verbose {
 		fmt.Println("Initializing variogram model...")
 	}
@@ -132,7 +125,6 @@ func NewOrdinaryKriging(x, y, z []float64, cfg OKConfig) (*OrdinaryKriging, erro
 		ok.printVariogramInfo()
 	}
 
-	// 计算拟合统计量
 	if cfg.EnableStatistics {
 		ok.computeStatistics()
 	}
@@ -140,6 +132,7 @@ func NewOrdinaryKriging(x, y, z []float64, cfg OKConfig) (*OrdinaryKriging, erro
 	return ok, nil
 }
 
+// validateInputs 验证输入数组的长度和非空要求，以及坐标类型的有效性。
 func validateInputs(x, y, z []float64, cfg OKConfig) error {
 	if len(x) == 0 || len(y) == 0 || len(z) == 0 {
 		return fmt.Errorf("input arrays must not be empty")
@@ -153,6 +146,7 @@ func validateInputs(x, y, z []float64, cfg OKConfig) error {
 	return nil
 }
 
+// setupVariogramModel 根据配置设置变差函数。支持内置模型和自定义函数。
 func (ok *OrdinaryKriging) setupVariogramModel(cfg OKConfig) error {
 	ok.VariogramModel = cfg.VariogramModel
 	if fn := LookupVariogramModel(cfg.VariogramModel); fn != nil {
@@ -168,6 +162,8 @@ func (ok *OrdinaryKriging) setupVariogramModel(cfg OKConfig) error {
 	return nil
 }
 
+// setupAnisotropy 对各向异性参数进行设置并调整坐标。
+// 仅在 euclidean 坐标类型下有效；geographic 坐标忽略各向异性。
 func (ok *OrdinaryKriging) setupAnisotropy(cfg OKConfig) {
 	if cfg.CoordinatesType != "euclidean" {
 		if cfg.AnisotropyScaling != 1.0 && ok.Verbose {
@@ -175,15 +171,14 @@ func (ok *OrdinaryKriging) setupAnisotropy(cfg OKConfig) {
 		}
 		ok.AnisotropyScaling = 1.0
 		ok.AnisotropyAngle = 0.0
-		ok.XAdjusted = copySlice(ok.XOrig)
-		ok.YAdjusted = copySlice(ok.YOrig)
+		ok.XAdjusted = append([]float64{}, ok.XOrig...)
+		ok.YAdjusted = append([]float64{}, ok.YOrig...)
 		return
 	}
 
 	ok.AnisotropyScaling = cfg.AnisotropyScaling
 	ok.AnisotropyAngle = cfg.AnisotropyAngle
 
-	// 使用 (max+min)/2 计算中心（对齐 PyKrige）
 	xMin, xMax := utils.MinMax(ok.XOrig...)
 	yMin, yMax := utils.MinMax(ok.YOrig...)
 	ok.XCenter = (xMax + xMin) / 2
@@ -212,6 +207,7 @@ func (ok *OrdinaryKriging) setupAnisotropy(cfg OKConfig) {
 	}
 }
 
+// computeStatistics 使用留一交叉验证法计算模型质量统计（Q1、Q2、cR）。
 func (ok *OrdinaryKriging) computeStatistics() {
 	if ok.Verbose {
 		fmt.Println("Calculating statistics on variogram model fit...")
@@ -229,11 +225,8 @@ func (ok *OrdinaryKriging) computeStatistics() {
 	}
 }
 
-// ============================================================
-//  克里金矩阵构建与求解
-// ============================================================
-
-// krigingMatrix 构建 (n+1)×(n+1) 的普通克里金矩阵。
+// krigingMatrix 构建克里金方程组的系数矩阵 A（(n+1)×(n+1)）。
+// A[i][j] = -γ(h_ij)，A[i][i] = 0，最后一行/列用于拉格朗日乘子。
 func (ok *OrdinaryKriging) krigingMatrix() [][]float64 {
 	n := len(ok.XAdjusted)
 	n1 := n + 1
@@ -248,15 +241,15 @@ func (ok *OrdinaryKriging) krigingMatrix() [][]float64 {
 			dist := ok.distanceBetween(i, j)
 			a[i][j] = -variogramValue(ok.VariogramFunc, ok.VariogramModelParameters, dist)
 		}
-		a[i][i] = 0.0 // 对角线
-		a[n][i] = 1.0 // Lagrange 乘数
+		a[i][i] = 0.0
+		a[n][i] = 1.0
 		a[i][n] = 1.0
 	}
 
 	return a
 }
 
-// distanceBetween 返回数据集中两点 i, j 之间的距离。
+// distanceBetween 计算第 i 和第 j 个已知点之间的距离。
 func (ok *OrdinaryKriging) distanceBetween(i, j int) float64 {
 	if ok.CoordinatesType == "euclidean" {
 		return EuclideanDistance(ok.XAdjusted[i], ok.YAdjusted[i],
@@ -266,7 +259,7 @@ func (ok *OrdinaryKriging) distanceBetween(i, j int) float64 {
 		ok.XAdjusted[j], ok.YAdjusted[j])
 }
 
-// distancesTo 计算数据集中所有点到目标点 (xpt, ypt) 的距离。
+// distancesTo 计算目标点 (xpt, ypt) 到所有已知点的距离向量。
 func (ok *OrdinaryKriging) distancesTo(xpt, ypt float64) []float64 {
 	n := len(ok.XAdjusted)
 	bd := make([]float64, n)
@@ -282,7 +275,8 @@ func (ok *OrdinaryKriging) distancesTo(xpt, ypt float64) []float64 {
 	return bd
 }
 
-// solveKrigingSystem 使用预计算的逆矩阵求解单点的克里金系统。
+// solveKrigingSystem 使用预先求逆的系数矩阵求解克里金系统。
+// 返回插值值和克里金方差。
 func (ok *OrdinaryKriging) solveKrigingSystem(aInv *matWrapper, bd []float64) (zvalue, sigmasq float64) {
 	n := len(ok.XAdjusted)
 	n1 := n + 1
@@ -297,7 +291,6 @@ func (ok *OrdinaryKriging) solveKrigingSystem(aInv *matWrapper, bd []float64) (z
 	b[n] = 1.0
 
 	x := aInv.MulVec(b)
-
 	for i := 0; i < n; i++ {
 		zvalue += x[i] * ok.Z[i]
 	}
@@ -307,46 +300,35 @@ func (ok *OrdinaryKriging) solveKrigingSystem(aInv *matWrapper, bd []float64) (z
 	return
 }
 
-// ============================================================
-//  执行插值
-// ============================================================
-
-// executeLoop 对所有目标点逐点求解克里金系统。
+// executeLoop 对一系列目标点执行克里金插值。
+// 先构建并求逆克里金矩阵（只需一次），然后对每个目标点求解。
+// mask 为 true 的索引将被跳过（用于 masked 模式）。
 func (ok *OrdinaryKriging) executeLoop(xpts, ypts []float64, mask []bool) (zvalues, sigmasq []float64) {
 	npt := len(xpts)
 	zvalues = make([]float64, npt)
 	sigmasq = make([]float64, npt)
-
 	a := ok.krigingMatrix()
 	aInv := invertMatrix(a, ok.PseudoInv)
-
-	var wg sync.WaitGroup
-	pool, _ := ants.NewPoolWithFunc(runtime.NumCPU(), func(arg interface{}) {
-		defer wg.Done()
-		j := arg.(int)
-		bd := ok.distancesTo(xpts[j], ypts[j])
-		zvalues[j], sigmasq[j] = ok.solveKrigingSystem(aInv, bd)
-	})
-	defer pool.Release()
 
 	for j := 0; j < npt; j++ {
 		if mask != nil && mask[j] {
 			continue
 		}
-		wg.Add(1)
-		_ = pool.Invoke(j)
+		bd := ok.distancesTo(xpts[j], ypts[j])
+		zvalues[j], sigmasq[j] = ok.solveKrigingSystem(aInv, bd)
 	}
-	wg.Wait()
 	return
 }
 
-// Execute 计算克里金插值网格及其方差。
+// Execute 执行克里金插值的主方法。
 //
-// style: "grid" / "points" / "masked"
-//   - grid:   xpoints 和 ypoints 定义矩形网格
-//   - points: xpoints 和 ypoints 为坐标对（等长）
-//   - masked: 同 grid，mask 标记跳过的点（true = 跳过）
-func (ok *OrdinaryKriging) Execute(style string, xpoints, ypoints []float64, mask []bool) (*mat.Dense, *mat.Dense) {
+// 支持三种模式：
+//   - "grid": 在 X×Y 的笛卡尔积网格上插值
+//   - "points": 在 (X[i], Y[i]) 点对序列上插值
+//   - "masked": 在网格上插值但跳过 mask 为 true 的点
+//
+// 返回插值矩阵和方差矩阵。
+func (ok *OrdinaryKriging) Execute(style string, xPoints, yPoints []float64, mask []bool) (*mat.Dense, *mat.Dense) {
 	if ok.Verbose {
 		fmt.Println("Executing Ordinary Kriging...")
 	}
@@ -354,15 +336,13 @@ func (ok *OrdinaryKriging) Execute(style string, xpoints, ypoints []float64, mas
 	if style != "grid" && style != "masked" && style != "points" {
 		panic("style must be 'grid', 'points', or 'masked'")
 	}
-
-	xpts := copySlice(xpoints)
-	ypts := copySlice(ypoints)
+	xpts := append([]float64{}, xPoints...)
+	ypts := append([]float64{}, yPoints...)
 
 	var flatMask []bool
 	var npt int
 	nx, ny := len(xpts), len(ypts)
 
-	// Meshgrid 展开
 	switch style {
 	case "grid", "masked":
 		if style == "masked" {
@@ -372,7 +352,7 @@ func (ok *OrdinaryKriging) Execute(style string, xpoints, ypoints []float64, mas
 			if len(mask) != ny*nx {
 				panic("mask dimensions do not match grid dimensions")
 			}
-			flatMask = copySliceBool(mask)
+			flatMask = append([]bool{}, mask...)
 		}
 		npt = ny * nx
 		gridX := make([]float64, npt)
@@ -386,31 +366,24 @@ func (ok *OrdinaryKriging) Execute(style string, xpoints, ypoints []float64, mas
 		}
 		xpts, ypts = gridX, gridY
 
-	default: // "points"
+	default:
 		if nx != ny {
-			panic("xpoints and ypoints must have same length for 'points' style")
+			panic("xPoints and yPoints must have same length for 'points' style")
 		}
 		npt = nx
 	}
-
-	// 各向异性坐标调整
+	// 对目标点同样应用各向异性调整
 	if ok.CoordinatesType == "euclidean" {
 		points := make([][]float64, npt)
 		for i := 0; i < npt; i++ {
 			points[i] = []float64{xpts[i], ypts[i]}
 		}
-		adjusted := AdjustForAnisotropy(
-			points,
-			[]float64{ok.XCenter, ok.YCenter},
-			[]float64{ok.AnisotropyScaling},
-			[]float64{ok.AnisotropyAngle},
-		)
+		adjusted := AdjustForAnisotropy(points, []float64{ok.XCenter, ok.YCenter}, []float64{ok.AnisotropyScaling}, []float64{ok.AnisotropyAngle})
 		for i := range adjusted {
 			xpts[i], ypts[i] = adjusted[i][0], adjusted[i][1]
 		}
 	}
 
-	// 求解 + 输出整形
 	zv, ss := ok.executeLoop(xpts, ypts, flatMask)
 	if style == "grid" || style == "masked" {
 		return mat.NewDense(ny, nx, zv), mat.NewDense(ny, nx, ss)
@@ -418,40 +391,35 @@ func (ok *OrdinaryKriging) Execute(style string, xpoints, ypoints []float64, mas
 	return mat.NewDense(1, npt, zv), mat.NewDense(1, npt, ss)
 }
 
-// ExecuteGrid 便捷方法：以 grid 风格执行克里金插值。
-func (ok *OrdinaryKriging) ExecuteGrid(xpoints, ypoints []float64) (*mat.Dense, *mat.Dense) {
-	return ok.Execute("grid", xpoints, ypoints, nil)
+// ExecuteGrid 在 X 和 Y 坐标的笛卡尔积网格上执行克里金插值。
+// 是 Execute("grid", ...) 的便捷方法。
+func (ok *OrdinaryKriging) ExecuteGrid(xPoints, yPoints []float64) (*mat.Dense, *mat.Dense) {
+	return ok.Execute("grid", xPoints, yPoints, nil)
 }
 
-// ============================================================
-//  访问器
-// ============================================================
-
-// GetVariogramPoints 返回 lags 和评估后的变异函数值。
+// GetVariogramPoints 返回用于绘图或分析的拟合变差函数值。
+// 返回 (距离, 拟合半方差) 对。
 func (ok *OrdinaryKriging) GetVariogramPoints() ([]float64, []float64) {
 	return ok.Lags, ok.VariogramFunc(ok.VariogramModelParameters, ok.Lags)
 }
 
-// GetStatistics 返回 Q1, Q2, cR 统计量。
+// GetStatistics 返回模型质量统计量 (Q1, Q2, cR)。
 func (ok *OrdinaryKriging) GetStatistics() (float64, float64, float64) {
 	return ok.Q1, ok.Q2, ok.CR
 }
 
-// GetEpsilonResiduals 返回 epsilon 残差。
+// GetEpsilonResiduals 返回标准化残差向量。
 func (ok *OrdinaryKriging) GetEpsilonResiduals() []float64 {
 	return ok.Epsilon
 }
 
-// SwitchVerbose 切换详细输出模式。
+// SwitchVerbose 切换详细日志输出的开关状态。
 func (ok *OrdinaryKriging) SwitchVerbose() {
 	ok.Verbose = !ok.Verbose
 }
 
-// ============================================================
-//  更新变异函数模型
-// ============================================================
-
-// UpdateVariogramModel 更新变异函数模型和/或参数。
+// UpdateVariogramModel 更新变差函数模型、参数和各向异性配置。
+// 更新后会自动重新拟合变差函数和计算统计量。
 func (ok *OrdinaryKriging) UpdateVariogramModel(
 	model string,
 	params interface{},
@@ -472,7 +440,6 @@ func (ok *OrdinaryKriging) UpdateVariogramModel(
 	}
 	ok.VariogramModel = model
 
-	// 更新各向异性（仅 euclidean 坐标系）
 	if anisoScaling != ok.AnisotropyScaling || anisoAngle != ok.AnisotropyAngle {
 		if ok.CoordinatesType == "euclidean" {
 			ok.AnisotropyScaling = anisoScaling
@@ -499,11 +466,11 @@ func (ok *OrdinaryKriging) UpdateVariogramModel(
 		ok.printVariogramInfo()
 	}
 
-	// 重算统计量
 	ok.computeStatistics()
 	return nil
 }
 
+// recomputeAdjusted 根据当前的各向异性参数重新计算调整后的坐标。
 func (ok *OrdinaryKriging) recomputeAdjusted() {
 	points := make([][]float64, len(ok.XOrig))
 	for i := range ok.XOrig {
@@ -521,10 +488,7 @@ func (ok *OrdinaryKriging) recomputeAdjusted() {
 	}
 }
 
-// ============================================================
-//  日志输出
-// ============================================================
-
+// printVariogramInfo 输出当前变差函数模型的详细信息。
 func (ok *OrdinaryKriging) printVariogramInfo() {
 	fmt.Printf("Coordinates type: '%s'\n", ok.CoordinatesType)
 	p := ok.VariogramModelParameters
@@ -550,17 +514,14 @@ func (ok *OrdinaryKriging) printVariogramInfo() {
 	}
 }
 
-// ============================================================
-//  矩阵工具（内部使用）
-// ============================================================
-
-// matWrapper 是一个支持求逆的稠密矩阵包装器。
+// matWrapper 是一个轻量级的矩阵包装器，用于高效的矩阵-向量乘法。
+// 避免完全依赖 gonum/mat 的开销。
 type matWrapper struct {
 	data       []float64
 	rows, cols int
 }
 
-// MulVec 计算矩阵与向量的乘积。
+// MulVec 执行矩阵-向量乘法 y = M * b。
 func (m *matWrapper) MulVec(b []float64) []float64 {
 	result := make([]float64, m.rows)
 	for i := 0; i < m.rows; i++ {
@@ -574,15 +535,19 @@ func (m *matWrapper) MulVec(b []float64) []float64 {
 	return result
 }
 
-// invertMatrix 使用高斯消元（部分选主元）求矩阵的逆。
-// 若 pseudoInv 为 true 或矩阵奇异，则使用 SVD 伪逆。
+// invertMatrix 对矩阵求逆。
+//
+// 策略：
+//  1. 若 pseudoInv 为 true，使用 gonum 的伪逆
+//  2. 默认使用带部分主元选取的高斯-约当消元法
+//  3. 若主元过小（接近奇异），回退到伪逆
+//  4. 伪逆失败时再回退到纯高斯消元法
 func invertMatrix(a [][]float64, pseudoInv bool) *matWrapper {
 	n := len(a)
 	if pseudoInv {
 		return pseudoInverse(a)
 	}
 
-	// 增广矩阵 [A | I]
 	n2 := 2 * n
 	aug := make([][]float64, n)
 	for i := 0; i < n; i++ {
@@ -591,7 +556,7 @@ func invertMatrix(a [][]float64, pseudoInv bool) *matWrapper {
 		aug[i][n+i] = 1.0
 	}
 
-	// 前向消元（部分选主元）
+	// 前向消元（带部分主元选取）
 	for col := 0; col < n; col++ {
 		pivotRow := col
 		maxVal := math.Abs(aug[col][col])
@@ -635,7 +600,6 @@ func invertMatrix(a [][]float64, pseudoInv bool) *matWrapper {
 		}
 	}
 
-	// 提取逆矩阵
 	inv := &matWrapper{rows: n, cols: n, data: make([]float64, n*n)}
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
@@ -645,14 +609,15 @@ func invertMatrix(a [][]float64, pseudoInv bool) *matWrapper {
 	return inv
 }
 
-// pseudoInverse 使用 gonum 计算矩阵逆，失败时回退到高斯消元。
+// pseudoInverse 使用 gonum 计算矩阵的伪逆（Moore-Penrose）。
+// 若 gonum 求逆也失败，回退到 invertByGauss。
 func pseudoInverse(a [][]float64) *matWrapper {
 	n := len(a)
 	if n == 0 {
 		return &matWrapper{}
 	}
 
-	flat := matToFlat(a, n, n)
+	flat := utils.MatToFlat(a, n, n)
 	matA := mat.NewDense(n, n, flat)
 
 	var aInv mat.Dense
@@ -660,15 +625,16 @@ func pseudoInverse(a [][]float64) *matWrapper {
 		if inv := invertByGauss(a); inv != nil {
 			return inv
 		}
-		return &matWrapper{rows: n, cols: n}
+		return &matWrapper{rows: n, cols: n, data: make([]float64, n*n)}
 	}
 
-	inv := &matWrapper{rows: n, cols: n, data: make([]float64, n*n)}
-	copy(inv.data, aInv.RawMatrix().Data)
+	inv := &matWrapper{rows: n, cols: n}
+	inv.data = append([]float64{}, aInv.RawMatrix().Data...)
 	return inv
 }
 
-// invertByGauss 高斯消元（部分选主元）求逆，仅在 pseudoInverse 失败时作为最终回退。
+// invertByGauss 使用纯高斯-约当消元法求逆（无回退策略）。
+// 作为最后的 fallback，若主元过小则返回 nil。
 func invertByGauss(a [][]float64) *matWrapper {
 	n := len(a)
 	n2 := 2 * n
@@ -680,7 +646,6 @@ func invertByGauss(a [][]float64) *matWrapper {
 		aug[i][n+i] = 1.0
 	}
 
-	// 前向消元 + 部分选主元
 	for col := 0; col < n; col++ {
 		pivotRow := col
 		maxVal := math.Abs(aug[col][col])
@@ -691,7 +656,7 @@ func invertByGauss(a [][]float64) *matWrapper {
 			}
 		}
 		if maxVal < eps {
-			return nil // 矩阵奇异
+			return nil
 		}
 		if pivotRow != col {
 			aug[col], aug[pivotRow] = aug[pivotRow], aug[col]
@@ -707,7 +672,6 @@ func invertByGauss(a [][]float64) *matWrapper {
 		}
 	}
 
-	// 回代
 	for col := n - 1; col >= 0; col-- {
 		pivot := aug[col][col]
 		if math.Abs(pivot) < eps {
@@ -731,30 +695,4 @@ func invertByGauss(a [][]float64) *matWrapper {
 		}
 	}
 	return inv
-}
-
-// ============================================================
-//  辅助函数
-// ============================================================
-
-func copySlice[T any](s []T) []T {
-	out := make([]T, len(s))
-	copy(out, s)
-	return out
-}
-
-func copySliceBool(s []bool) []bool {
-	out := make([]bool, len(s))
-	copy(out, s)
-	return out
-}
-
-func matToFlat(a [][]float64, rows, cols int) []float64 {
-	flat := make([]float64, rows*cols)
-	for i := 0; i < rows; i++ {
-		for j := 0; j < cols; j++ {
-			flat[i*cols+j] = a[i][j]
-		}
-	}
-	return flat
 }

@@ -1,30 +1,21 @@
-// Package kriging 实现了 2D 普通克里金（Ordinary Kriging）插值算法。
-//
-// 本包是 PyKrige 库的 Go 语言移植，支持多种变异函数模型：
-//   - linear: 线性模型
-//   - power: 幂模型
-//   - gaussian: 高斯模型
-//   - spherical: 球状模型（默认）
-//   - exponential: 指数模型
-//   - hole-effect: 孔洞效应模型
-//
-// 支持欧氏距离和地理距离（大圆距离）两种坐标系。
 package kriging
 
 import "math"
 
-// VariogramFunc 是变异函数模型的函数签名。
-// m 是模型参数，d 是评估距离（可能多个）。
+// VariogramFunc 定义变差函数类型。
+// 参数 m 为模型参数数组，d 为距离数组，返回对应距离下的半方差值。
 type VariogramFunc func(m, d []float64) []float64
 
-// variogramValue 计算单个距离值处的变异函数值，避免重复创建单元素切片。
+// variogramValue 计算单个距离点的变差函数值。
+// 是 VariogramFunc 的单值版本辅助函数。
 func variogramValue(fn VariogramFunc, params []float64, dist float64) float64 {
 	d := [1]float64{dist}
 	return fn(params, d[:])[0]
 }
 
-// LinearVariogramModel 线性变异函数模型。
-// m = [slope, nugget], γ(d) = slope * d + nugget
+// LinearVariogramModel 线性变差函数模型。
+// 参数: m[0]=slope（斜率）, m[1]=nugget（块金值）。
+// 公式: γ(d) = slope * d + nugget
 func LinearVariogramModel(m, d []float64) []float64 {
 	slope, nugget := m[0], m[1]
 	result := make([]float64, len(d))
@@ -34,8 +25,9 @@ func LinearVariogramModel(m, d []float64) []float64 {
 	return result
 }
 
-// PowerVariogramModel 幂变异函数模型。
-// m = [scale, exponent, nugget], γ(d) = scale * d^exponent + nugget
+// PowerVariogramModel 幂变差函数模型。
+// 参数: m[0]=scale（比例）, m[1]=exponent（指数，范围 0<exp<2）, m[2]=nugget（块金值）。
+// 公式: γ(d) = scale * d^exponent + nugget
 func PowerVariogramModel(m, d []float64) []float64 {
 	scale, exponent, nugget := m[0], m[1], m[2]
 	result := make([]float64, len(d))
@@ -45,8 +37,10 @@ func PowerVariogramModel(m, d []float64) []float64 {
 	return result
 }
 
-// GaussianVariogramModel 高斯变异函数模型。
-// m = [psill, range, nugget], γ(d) = psill * (1 - exp(-d² / (range*4/7)²)) + nugget
+// GaussianVariogramModel 高斯变差函数模型。
+// 参数: m[0]=psill（偏基台值）, m[1]=range（范围）, m[2]=nugget（块金值）。
+// 有效范围 effRange = range * 4/7（约 57% 的范围处达到 95% 的基台值）。
+// 公式: γ(d) = psill * (1 - exp(-d²/effRange²)) + nugget
 func GaussianVariogramModel(m, d []float64) []float64 {
 	psill, rng, nugget := m[0], m[1], m[2]
 	effRange := rng * 4.0 / 7.0
@@ -57,8 +51,10 @@ func GaussianVariogramModel(m, d []float64) []float64 {
 	return result
 }
 
-// ExponentialVariogramModel 指数变异函数模型。
-// m = [psill, range, nugget], γ(d) = psill * (1 - exp(-d / (range/3))) + nugget
+// ExponentialVariogramModel 指数变差函数模型。
+// 参数: m[0]=psill（偏基台值）, m[1]=range（范围）, m[2]=nugget（块金值）。
+// 有效范围 effRange = range / 3（在 range 处达到约 95% 的基台值）。
+// 公式: γ(d) = psill * (1 - exp(-d/effRange)) + nugget
 func ExponentialVariogramModel(m, d []float64) []float64 {
 	psill, rng, nugget := m[0], m[1], m[2]
 	effRange := rng / 3.0
@@ -69,10 +65,12 @@ func ExponentialVariogramModel(m, d []float64) []float64 {
 	return result
 }
 
-// SphericalVariogramModel 球状变异函数模型。
-// m = [psill, range, nugget]
-// γ(d) = psill * (1.5*d/range - 0.5*(d/range)³) + nugget  (d ≤ range)
-// γ(d) = psill + nugget                                    (d > range)
+// SphericalVariogramModel 球状变差函数模型（最常用的地统计模型之一）。
+// 参数: m[0]=psill（偏基台值）, m[1]=range（范围）, m[2]=nugget（块金值）。
+// 公式:
+//
+//	若 d <= range: γ(d) = psill * (1.5*r - 0.5*r³) + nugget  (r = d/range)
+//	若 d >  range: γ(d) = psill + nugget
 func SphericalVariogramModel(m, d []float64) []float64 {
 	psill, rng, nugget := m[0], m[1], m[2]
 	result := make([]float64, len(d))
@@ -87,8 +85,11 @@ func SphericalVariogramModel(m, d []float64) []float64 {
 	return result
 }
 
-// HoleEffectVariogramModel 孔洞效应变异函数模型。
-// m = [psill, range, nugget], γ(d) = psill * (1 - (1 - d/(range/3)) * exp(-d/(range/3))) + nugget
+// HoleEffectVariogramModel 孔穴效应变差函数模型。
+// 适用于存在周期性波动（孔穴效应）的数据。
+// 参数: m[0]=psill（偏基台值）, m[1]=range（范围）, m[2]=nugget（块金值）。
+// 有效范围 effRange = range / 3。
+// 公式: γ(d) = psill * (1 - (1 - d/effRange) * exp(-d/effRange)) + nugget
 func HoleEffectVariogramModel(m, d []float64) []float64 {
 	psill, rng, nugget := m[0], m[1], m[2]
 	effRange := rng / 3.0
@@ -99,7 +100,7 @@ func HoleEffectVariogramModel(m, d []float64) []float64 {
 	return result
 }
 
-// variogramModels 变异函数模型名称到实现的映射。
+// variogramModels 内置变差函数模型名称到函数的映射。
 var variogramModels = map[string]VariogramFunc{
 	"linear":      LinearVariogramModel,
 	"power":       PowerVariogramModel,
@@ -109,7 +110,8 @@ var variogramModels = map[string]VariogramFunc{
 	"hole-effect": HoleEffectVariogramModel,
 }
 
-// LookupVariogramModel 根据名称查找变异函数模型实现，未找到返回 nil。
+// LookupVariogramModel 根据名称查找内置变差函数模型。
+// 返回 nil 表示模型不存在（需使用自定义函数）。
 func LookupVariogramModel(name string) VariogramFunc {
 	return variogramModels[name]
 }
