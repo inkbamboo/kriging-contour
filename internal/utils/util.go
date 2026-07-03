@@ -57,6 +57,8 @@ func MinMax[T constraints.Ordered](items ...T) (T, T) {
 	return minVal, maxVal
 }
 
+// Min 返回切片元素中的最小值。
+// 使用泛型支持任何 constraints.Ordered 类型（如 float64、int 等）。
 func Min[T constraints.Ordered](items ...T) T {
 	if len(items) == 0 {
 		return *new(T)

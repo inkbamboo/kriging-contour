@@ -21,10 +21,12 @@ func ExtractPeaks(grid *Grid, boundary orb.Polygon) []*Point {
 	if cols < 3 || rows < 3 || len(boundary) == 0 {
 		return nil
 	}
-	// 归一化边界坐标 [Y,X] → [X,Y]
-	for ri := range boundary {
-		for i := range boundary[ri] {
-			boundary[ri][i][0], boundary[ri][i][1] = boundary[ri][i][1], boundary[ri][i][0]
+	// 归一化边界坐标 [Y,X] → [X,Y]，使用副本避免修改调用者的原始数据
+	normBoundary := make(orb.Polygon, len(boundary))
+	for ri, ring := range boundary {
+		normBoundary[ri] = make(orb.Ring, len(ring))
+		for i, p := range ring {
+			normBoundary[ri][i] = orb.Point{p[1], p[0]}
 		}
 	}
 	// 预计算每个格点是否在边界内
@@ -32,7 +34,7 @@ func ExtractPeaks(grid *Grid, boundary orb.Polygon) []*Point {
 	for r := 0; r < rows; r++ {
 		inside[r] = make([]bool, cols)
 		for c := 0; c < cols; c++ {
-			inside[r][c] = planar.PolygonContains(boundary, orb.Point{grid.X(c), grid.Y(r)})
+			inside[r][c] = planar.PolygonContains(normBoundary, orb.Point{grid.X(c), grid.Y(r)})
 		}
 	}
 

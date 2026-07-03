@@ -683,7 +683,7 @@ func buildKrigingDistance(X, Y []float64, tx, ty float64, coordType string, n in
 
 // FindStatistics 使用留一交叉验证法计算克里金模型的质量统计。
 //
-// 对每个数据点，用前面所有点预测该点，计算：
+// 对每个数据点 i，用除 i 以外的所有点预测该点，计算：
 //   - delta: 预测误差（Z_actual - Z_predicted）
 //   - sigma: 预测标准差
 //   - epsilon: 标准化残差（delta / sigma）
@@ -699,9 +699,22 @@ func FindStatistics(
 	allDelta := make([]float64, n)
 	allSigma := make([]float64, n)
 
-	for i := 1; i < n; i++ {
+	// 预分配排除切片，避免每次循环重新分配
+	xLeave := make([]float64, n-1)
+	yLeave := make([]float64, n-1)
+	zLeave := make([]float64, n-1)
+
+	for i := 0; i < n; i++ {
+		// 构建排除第 i 个点后的数据集
+		copy(xLeave, X[:i])
+		copy(xLeave[i:], X[i+1:])
+		copy(yLeave, Y[:i])
+		copy(yLeave[i:], Y[i+1:])
+		copy(zLeave, Z[:i])
+		copy(zLeave[i:], Z[i+1:])
+
 		k, ss := Krige(
-			X[:i], Y[:i], Z[:i],
+			xLeave, yLeave, zLeave,
 			X[i], Y[i],
 			vfn, vfnParams,
 			coordType, pseudoInv,

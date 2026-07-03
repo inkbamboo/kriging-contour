@@ -219,7 +219,7 @@ func (g *Grid) Normalize(gridMin, gridMax, origMin, origMax float64, levels []fl
 	if gridMax-gridMin <= 1e-10 {
 		return
 	}
-	if levels[len(levels)-1]-levels[0] > 1e-10 {
+	if len(levels) > 0 && levels[len(levels)-1]-levels[0] > 1e-10 {
 		for i := 0; i < rows; i++ {
 			for j := 0; j < cols; j++ {
 				v := g.Data.At(i, j)
