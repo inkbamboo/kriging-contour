@@ -145,6 +145,11 @@ func levelBandColors(n int) []color.Color {
 
 // lerpColor 在两个 RGBA 颜色之间进行线性插值。
 // s 为插值因子，范围 [0, 1]，0 返回 c0，1 返回 c1。
+//
+// 已知问题（暂不修复以保持与既有输出一致）：uint8 通道直接相减存在下溢回绕
+// （如 0-255 回绕为 1），导致某些色带渐变错误。正确写法为先转 float64 再作差：
+//
+//	uint8(float64(a) + s*(float64(b)-float64(a)))
 func lerpColor(s float64, c0, c1 color.RGBA) color.RGBA {
 	return color.RGBA{
 		R: uint8(float64(c0.R) + s*float64(c1.R-c0.R)),

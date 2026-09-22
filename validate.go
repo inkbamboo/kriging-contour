@@ -70,10 +70,8 @@ func ValidatePoints(points []*Point, minPoints int) (cleaned []*Point, err error
 		return clean, fmt.Errorf("清洗后有效数据点不足 (需要至少 %d 个，当前 %d 个)", minPoints, len(clean))
 	}
 
-	if len(clean) >= 3 {
-		if isCollinearPoints(clean) {
-			fmt.Println("[WARN] 数据校验警告: 所有数据点共线，克里金插值结果可能不准确")
-		}
+	if len(clean) >= 3 && isCollinearPoints(clean) {
+		fmt.Println("[WARN] 数据校验警告: 所有数据点共线，克里金插值结果可能不准确")
 	}
 
 	return clean, nil

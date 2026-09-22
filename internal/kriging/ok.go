@@ -48,18 +48,18 @@ type OrdinaryKriging struct {
 
 // OKConfig 定义创建 OrdinaryKriging 实例的配置参数。
 type OKConfig struct {
-	VariogramModel      string         // 变差函数模型名称
-	VariogramParameters interface{}    // 模型参数（[]float64 或 map[string]float64）
-	VariogramFunction   VariogramFunc  // 自定义变差函数（仅 model="custom" 时有效）
-	NLags               int            // 实验变差函数的分箱数
-	Weight              bool           // 是否在拟合中使用加权残差
-	AnisotropyScaling   float64        // 各向异性缩放因子（默认 1.0）
-	AnisotropyAngle     float64        // 各向异性旋转角度（度）
-	Verbose             bool           // 是否输出详细日志
-	EnableStatistics    bool           // 是否计算模型质量统计
-	CoordinatesType     string         // 坐标类型："euclidean" 或 "geographic"
-	ExactValues         bool           // 是否在重合点处返回精确值
-	PseudoInv           bool           // 是否使用伪逆
+	VariogramModel      string        // 变差函数模型名称
+	VariogramParameters interface{}   // 模型参数（[]float64 或 map[string]float64）
+	VariogramFunction   VariogramFunc // 自定义变差函数（仅 model="custom" 时有效）
+	NLags               int           // 实验变差函数的分箱数
+	Weight              bool          // 是否在拟合中使用加权残差
+	AnisotropyScaling   float64       // 各向异性缩放因子（默认 1.0）
+	AnisotropyAngle     float64       // 各向异性旋转角度（度）
+	Verbose             bool          // 是否输出详细日志
+	EnableStatistics    bool          // 是否计算模型质量统计
+	CoordinatesType     string        // 坐标类型："euclidean" 或 "geographic"
+	ExactValues         bool          // 是否在重合点处返回精确值
+	PseudoInv           bool          // 是否使用伪逆
 }
 
 // DefaultOKConfig 返回默认的 OK 配置。
@@ -112,12 +112,11 @@ func NewOrdinaryKriging(x, y, z []float64, cfg OKConfig) (*OrdinaryKriging, erro
 		return nil, fmt.Errorf("variogram parameter error: %w", err)
 	}
 
-	ok.Lags, ok.Semivariance, ok.VariogramModelParameters, err = InitializeVariogramModel(
+	if ok.Lags, ok.Semivariance, ok.VariogramModelParameters, err = InitializeVariogramModel(
 		ok.XAdjusted, ok.YAdjusted, ok.Z,
 		ok.VariogramModel, vpTemp, ok.VariogramFunc,
 		cfg.NLags, cfg.Weight, cfg.CoordinatesType,
-	)
-	if err != nil {
+	); err != nil {
 		return nil, fmt.Errorf("variogram initialization failed: %w", err)
 	}
 
@@ -133,9 +132,13 @@ func NewOrdinaryKriging(x, y, z []float64, cfg OKConfig) (*OrdinaryKriging, erro
 }
 
 // validateInputs 验证输入数组的长度和非空要求，以及坐标类型的有效性。
+// 至少需要 2 个点：单点无法计算成对距离（实验变差函数）。
 func validateInputs(x, y, z []float64, cfg OKConfig) error {
 	if len(x) == 0 || len(y) == 0 || len(z) == 0 {
 		return fmt.Errorf("input arrays must not be empty")
+	}
+	if len(x) < 2 {
+		return fmt.Errorf("at least 2 data points are required, got %d", len(x))
 	}
 	if len(x) != len(y) || len(x) != len(z) {
 		return fmt.Errorf("x, y, z arrays must have the same length")
@@ -440,12 +443,12 @@ func (ok *OrdinaryKriging) UpdateVariogramModel(
 	}
 	ok.VariogramModel = model
 
-	if anisoScaling != ok.AnisotropyScaling || anisoAngle != ok.AnisotropyAngle {
-		if ok.CoordinatesType == "euclidean" {
-			ok.AnisotropyScaling = anisoScaling
-			ok.AnisotropyAngle = anisoAngle
-			ok.recomputeAdjusted()
-		}
+	// 仅 euclidean 坐标支持各向异性调整，参数变化时需重算调整后坐标
+	if (anisoScaling != ok.AnisotropyScaling || anisoAngle != ok.AnisotropyAngle) &&
+		ok.CoordinatesType == "euclidean" {
+		ok.AnisotropyScaling = anisoScaling
+		ok.AnisotropyAngle = anisoAngle
+		ok.recomputeAdjusted()
 	}
 
 	vpTemp, err := MakeVariogramParameterList(model, params)
@@ -453,12 +456,11 @@ func (ok *OrdinaryKriging) UpdateVariogramModel(
 		return err
 	}
 
-	ok.Lags, ok.Semivariance, ok.VariogramModelParameters, err = InitializeVariogramModel(
+	if ok.Lags, ok.Semivariance, ok.VariogramModelParameters, err = InitializeVariogramModel(
 		ok.XAdjusted, ok.YAdjusted, ok.Z,
 		ok.VariogramModel, vpTemp, ok.VariogramFunc,
 		nlags, weight, ok.CoordinatesType,
-	)
-	if err != nil {
+	); err != nil {
 		return err
 	}
 

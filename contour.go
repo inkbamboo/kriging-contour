@@ -66,7 +66,6 @@ func GenerateLines(points []*Point, boundary orb.Polygon, opt *ContourOption) []
 		stats.MinX, stats.MaxX, stats.MinY, stats.MaxY,
 		stats.MinZ, stats.MaxZ, stats.NanCount, stats.InfCount, stats.DupCount)
 	var err error
-
 	if points, err = CheckParams(points, boundary, opt); err != nil {
 		return nil
 	}
@@ -118,24 +117,18 @@ func GetLevelList(points []*Point, opt *ContourOption) []float64 {
 		return opt.LevelList
 	}
 
+	// 过滤 nil/NaN/Inf 后取有效 Z 值范围
 	minZ, maxZ := math.Inf(1), math.Inf(-1)
-	firstValid := true
-
 	for _, p := range points {
 		if p == nil || math.IsNaN(p.Z) || math.IsInf(p.Z, 0) {
 			continue
 		}
-		if firstValid {
-			minZ, maxZ = p.Z, p.Z
-			firstValid = false
-		} else {
-			if p.Z < minZ {
-				minZ = p.Z
-			}
-			if p.Z > maxZ {
-				maxZ = p.Z
-			}
-		}
+		minZ = math.Min(minZ, p.Z)
+		maxZ = math.Max(maxZ, p.Z)
+	}
+	// 无有效数据则无法推算级别（否则 ±Inf 会污染后续生成）
+	if minZ > maxZ {
+		return nil
 	}
 	start := opt.ContourStart
 	end := opt.ContourEnd
@@ -313,12 +306,10 @@ func generateLevelLines(grid *Grid, level float64, canvasSize font.Length, bound
 		//   开放线：left↔right 翻转
 		if isClosed {
 			reversePoints(coords)
+		} else if highSide == "left" {
+			highSide = "right"
 		} else {
-			if highSide == "left" {
-				highSide = "right"
-			} else {
-				highSide = "left"
-			}
+			highSide = "left"
 		}
 
 		ls := orb.LineString(toOrbPoints(coords))
@@ -506,14 +497,8 @@ func sampleHighSide(grid *Grid, coords []*orb.Point, level float64, closed bool)
 		}
 	}
 
-	if countValid == 0 {
-		if closed {
-			return "inside"
-		}
-		return "left"
-	}
-
-	if countHigh > countValid/2 {
+	// 无有效采样或左法向多数偏高 → 高值在左侧（封闭线的左侧即内部）
+	if countValid == 0 || countHigh > countValid/2 {
 		if closed {
 			return "inside"
 		}

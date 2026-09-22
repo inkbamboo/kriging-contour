@@ -128,22 +128,8 @@ func newGridFromIDW(px, py, pz, gridX, gridY []float64) *Grid {
 		return nil
 	}
 
-	minX, maxX := px[0], px[0]
-	minY, maxY := py[0], py[0]
-	for i := range px {
-		if px[i] < minX {
-			minX = px[i]
-		}
-		if px[i] > maxX {
-			maxX = px[i]
-		}
-		if py[i] < minY {
-			minY = py[i]
-		}
-		if py[i] > maxY {
-			maxY = py[i]
-		}
-	}
+	minX, maxX := utils.MinMax(px...)
+	minY, maxY := utils.MinMax(py...)
 	scaleX := maxX - minX
 	scaleY := maxY - minY
 	if scaleX < 1e-10 {
@@ -227,13 +213,17 @@ func (g *Grid) Normalize(gridMin, gridMax, origMin, origMax float64, levels []fl
 				g.Data.Set(i, j, v)
 			}
 		}
-	} else if origMax-origMin > 1e-10 {
-		for i := 0; i < rows; i++ {
-			for j := 0; j < cols; j++ {
-				v := g.Data.At(i, j)
-				v = origMin + (v-gridMin)/(gridMax-gridMin)*(origMax-origMin)
-				g.Data.Set(i, j, v)
-			}
+		return
+	}
+	// 原始数据范围过小时无法有效映射，保留原值
+	if origMax-origMin <= 1e-10 {
+		return
+	}
+	for i := 0; i < rows; i++ {
+		for j := 0; j < cols; j++ {
+			v := g.Data.At(i, j)
+			v = origMin + (v-gridMin)/(gridMax-gridMin)*(origMax-origMin)
+			g.Data.Set(i, j, v)
 		}
 	}
 }
@@ -250,7 +240,7 @@ func (g *Grid) Sample(lon, lat float64) float64 {
 	if j >= g.Nx {
 		j = g.Nx - 1
 	}
-	if j > 0 && (j >= g.Nx || lon < g.XCoords[j]) {
+	if j > 0 && lon < g.XCoords[j] {
 		j--
 	}
 	if j >= g.Nx-1 {
@@ -264,7 +254,7 @@ func (g *Grid) Sample(lon, lat float64) float64 {
 	if i >= g.Ny {
 		i = g.Ny - 1
 	}
-	if i > 0 && (i >= g.Ny || lat < g.YCoords[i]) {
+	if i > 0 && lat < g.YCoords[i] {
 		i--
 	}
 	if i >= g.Ny-1 {
@@ -329,8 +319,9 @@ func GenerateGrid(points []*Point, boundary orb.Polygon, resolution int, levels 
 			fmt.Printf("[INFO] 步骤完成: 克里金网格插值 (耗时: %v)\n", time.Since(start).Round(time.Millisecond))
 		}
 	}()
-	minLon, maxLon := boundary.Bound().Min[1], boundary.Bound().Max[1]
-	minLat, maxLat := boundary.Bound().Min[0], boundary.Bound().Max[0]
+	bound := boundary.Bound()
+	minLon, maxLon := bound.Min[1], bound.Max[1]
+	minLat, maxLat := bound.Min[0], bound.Max[0]
 	gridX, gridY := generateGridCoords(minLon, minLat, maxLon, maxLat, resolution)
 	x := make([]float64, len(points))
 	y := make([]float64, len(points))
@@ -340,21 +331,22 @@ func GenerateGrid(points []*Point, boundary orb.Polygon, resolution int, levels 
 		y[i] = p.X
 		z[i] = p.Z
 	}
-	var ok *kriging.OrdinaryKriging
 	config := kriging.DefaultOKConfig()
 	config.CoordinatesType = "euclidean"
 	config.VariogramModel = "spherical"
 	config.Verbose = false
-	ok, err = kriging.NewOrdinaryKriging(x, y, z, config)
-	if err != nil || ok == nil {
-		err = fmt.Errorf("克里金插值失败 (将使用 IDW fallback): %w", err)
-		fmt.Printf("[WARN] 克里金插值失败，启用 IDW fallback 插值\n")
+	// err 为命名返回值（签名中已定义），ok 需预声明供后续使用；
+	// 赋值放进 if 初始化语句，避免 := 重复声明 err
+	var ok *kriging.OrdinaryKriging
+	if ok, err = kriging.NewOrdinaryKriging(x, y, z, config); err != nil || ok == nil {
+		fmt.Printf("[WARN] 克里金插值失败，启用 IDW fallback 插值: %v\n", err)
 		return IdwFallBack(x, y, z, gridX, gridY, levels)
 	}
-	var zvGrid *mat.Dense
-	zvGrid, _ = ok.ExecuteGrid(gridX, gridY)
+
+	// ExecuteGrid 返回 (插值矩阵, 方差矩阵)，无 error 返回值；
+	// 本流程不需要方差矩阵，失败形态（矩阵含 NaN/Inf）由下方检查兜底
+	zvGrid, _ := ok.ExecuteGrid(gridX, gridY)
 	if zvGrid == nil {
-		err = fmt.Errorf("克里金网格执行失败 (将使用 IDW fallback): %w", err)
 		fmt.Printf("[WARN] 克里金网格执行失败，启用 IDW fallback 插值\n")
 		return IdwFallBack(x, y, z, gridX, gridY, levels)
 	}
@@ -387,31 +379,30 @@ func GenerateGrid(points []*Point, boundary orb.Polygon, resolution int, levels 
 //   - error: 错误信息，包括网格列表为空、网格为空或尺寸不一致等情况
 //
 // 实现细节：
-//   1. 验证输入网格列表非空且所有网格具有相同尺寸
-//   2. 创建结果网格矩阵，尺寸与输入网格相同
-//   3. 使用 goroutine 池并行处理每一行数据
-//   4. 对每个网格点，先应用 convFn 转换，再应用 combineFn 聚合
-//   5. 使用预分配的切片避免重复内存分配
-//   6. 使用互斥锁保护对结果矩阵的并发写入
+//  1. 验证输入网格列表非空且所有网格具有相同尺寸
+//  2. 创建结果网格矩阵，尺寸与输入网格相同
+//  3. 使用 goroutine 池并行处理每一行数据
+//  4. 对每个网格点，先应用 convFn 转换，再应用 combineFn 聚合
+//  5. 使用预分配的切片避免重复内存分配
+//  6. 使用互斥锁保护对结果矩阵的并发写入
 func CombineGrid(gridList []*Grid, convFn func(gridIdx int, gridVal float64) float64, combineFn func(vals []float64) float64) (*Grid, error) {
 	if len(gridList) == 0 {
 		return nil, fmt.Errorf("gridList is empty")
 	}
 	refGrid := gridList[0]
 	if refGrid == nil {
-		return nil, fmt.Errorf("")
+		return nil, fmt.Errorf("gridList 首个网格为 nil")
 	}
 	cols, rows := refGrid.Dims()
 
 	// 检查所有网格尺寸是否一致
 	for _, grid := range gridList {
 		if grid == nil {
-			return nil, fmt.Errorf("")
+			return nil, fmt.Errorf("gridList 中存在 nil 网格")
 		}
 		c, r := grid.Dims()
 		if c != cols || r != rows {
-			// 尺寸不一致，无法合并
-			return nil, fmt.Errorf("")
+			return nil, fmt.Errorf("网格尺寸不一致 (期望 %d×%d, 实际 %d×%d)", cols, rows, c, r)
 		}
 	}
 	// 直接使用引用网格的坐标切片
@@ -425,7 +416,7 @@ func CombineGrid(gridList []*Grid, convFn func(gridIdx int, gridVal float64) flo
 	var wg sync.WaitGroup
 	var lock sync.Mutex
 
-	// 使用 goroutine 池并行处理每个 level 的等值线提取
+	// 使用 goroutine 池并行处理每行数据的合并
 	p, _ := ants.NewPoolWithFunc(poolSize, func(body interface{}) {
 		defer wg.Done()
 		// 为当前行预分配行数据

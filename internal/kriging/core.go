@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 
+	"github.com/inkbamboo/kriging-contour/internal/utils"
 	"gonum.org/v1/gonum/mat"
 )
 
@@ -221,6 +222,10 @@ func parseMapParams(model string, v map[string]float64) ([]float64, error) {
 func ComputeExperimentalVariogram(
 	X, Y, Z []float64, nlags int, coordType string,
 ) (lags, semivariance []float64) {
+	// 少于 2 个点没有点对可统计，直接返回空（避免下方 d[0] 越界 panic）
+	if len(X) < 2 || nlags < 1 {
+		return nil, nil
+	}
 
 	var d, g []float64
 
@@ -243,15 +248,7 @@ func ComputeExperimentalVariogram(
 		}
 	}
 
-	dmin, dmax := d[0], d[0]
-	for _, v := range d {
-		if v < dmin {
-			dmin = v
-		}
-		if v > dmax {
-			dmax = v
-		}
-	}
+	dmin, dmax := utils.MinMax(d...)
 
 	binWidth := (dmax - dmin) / float64(nlags)
 	bins := make([]float64, nlags+1)
@@ -310,14 +307,7 @@ func variogramResiduals(params, lags, semivariance []float64, vfn VariogramFunc,
 		return resid
 	}
 
-	xmin, xmax := lags[0], lags[0]
-	for _, v := range lags {
-		if v < xmin {
-			xmin = v
-		} else if v > xmax {
-			xmax = v
-		}
-	}
+	xmin, xmax := utils.MinMax(lags...)
 	dRange := xmax - xmin
 	k := 2.1972 / (0.1 * dRange)
 	x0 := 0.7*dRange + xmin
@@ -353,38 +343,21 @@ func setupParamBounds(model string, lags, semivariance []float64) paramBounds {
 		x0:    make([]float64, nParams),
 	}
 
-	b.semivMax, b.semivMin = semivariance[0], semivariance[0]
-	b.lagsMax, b.lagsMin = lags[0], lags[0]
-	for i := range semivariance {
-		if semivariance[i] > b.semivMax {
-			b.semivMax = semivariance[i]
-		}
-		if semivariance[i] < b.semivMin {
-			b.semivMin = semivariance[i]
-		}
-		if lags[i] > b.lagsMax {
-			b.lagsMax = lags[i]
-		}
-		if lags[i] < b.lagsMin {
-			b.lagsMin = lags[i]
-		}
-	}
+	b.semivMin, b.semivMax = utils.MinMax(semivariance...)
+	b.lagsMin, b.lagsMax = utils.MinMax(lags...)
 
-	switch {
-	case model == "linear":
+	if model == "linear" {
 		b.x0[0] = (b.semivMax - b.semivMin) / (b.lagsMax - b.lagsMin)
 		b.x0[1] = b.semivMin
 		b.lower[0], b.lower[1] = 0.0, 0.0
 		b.upper[0], b.upper[1] = math.Inf(1), b.semivMax
-
-	case model == "power":
+	} else if model == "power" {
 		b.x0[0] = (b.semivMax - b.semivMin) / (b.lagsMax - b.lagsMin)
 		b.x0[1] = 1.1
 		b.x0[2] = b.semivMin
 		b.lower[0], b.lower[1], b.lower[2] = 0.0, 0.001, 0.0
 		b.upper[0], b.upper[1], b.upper[2] = math.Inf(1), 1.999, b.semivMax
-
-	default:
+	} else {
 		b.x0[0] = b.semivMax - b.semivMin
 		b.x0[1] = 0.25 * b.lagsMax
 		b.x0[2] = b.semivMin
@@ -634,12 +607,12 @@ func Krige(
 	if err := xVec.SolveVec(aMat, bVec); err != nil {
 		var aInv mat.Dense
 		if errInv := aInv.Inverse(aMat); errInv != nil {
-			var sumZ, sumW float64
+			// 矩阵奇异且伪逆失败，回退为已知点均值（n==0 时为 NaN，由上层过滤）
+			var sumZ float64
 			for i := 0; i < n; i++ {
 				sumZ += Z[i]
-				sumW += 1.0
 			}
-			return sumZ / sumW, 0.0
+			return sumZ / float64(n), 0.0
 		}
 		xVec.MulVec(&aInv, bVec)
 	}
@@ -694,8 +667,12 @@ func FindStatistics(
 	coordType string,
 	pseudoInv bool,
 ) (delta, sigma, epsilon []float64) {
-
+	// 少于 2 个点无法留一（n-1 长度的切片在 n==0 时会 panic），返回空
 	n := len(Z)
+	if n < 2 {
+		return nil, nil, nil
+	}
+
 	allDelta := make([]float64, n)
 	allSigma := make([]float64, n)
 

@@ -28,6 +28,7 @@ type contourEntry struct {
 	isClosed bool         // 是否闭合
 	highSide string       // 高值侧方向："inside"/"outside" 或 "left"/"right"
 	coords   []*orb.Point // 坐标点序列
+	area     float64      // 闭环面积（开线为 0），解析时计算一次供排序与切割复用
 }
 
 // intersectionPt 表示等值线与边界的一个交点。
@@ -77,7 +78,6 @@ func GenerateFaces(features []*geojson.Feature, boundary orb.Polygon, opt *Conto
 	fmt.Printf("[INFO] 等值线特征数: %d (不含边界)\n", len(contourFeatures))
 
 	closeBoundaryPolygon(boundary)
-	boundaryPoly := boundary
 
 	entries := parseContourEntries(contourFeatures)
 	if len(entries) == 0 {
@@ -85,7 +85,7 @@ func GenerateFaces(features []*geojson.Feature, boundary orb.Polygon, opt *Conto
 		return nil
 	}
 
-	rawPolys := splitPolys(boundaryPoly, entries)
+	rawPolys := splitPolys(boundary, entries)
 	fmt.Printf("[INFO] 分割后碎片数: %d\n", len(rawPolys))
 	if len(rawPolys) == 0 {
 		fmt.Printf("[WARN] 分割后无碎片，返回空等值面\n")
@@ -167,13 +167,16 @@ func parseContourEntries(features []*geojson.Feature) []contourEntry {
 				ring = append(ring, ring[0])
 			}
 			poly := orb.Polygon{ring}
-			if planar.Area(poly) > 0.5 {
+			// 面积只计算一次，阈值判断与后续排序、切割复用
+			area := planar.Area(poly)
+			if area > 0.5 {
 				closedRings = append(closedRings, contourEntry{
 					geom:     poly,
 					level:    level,
 					isClosed: true,
 					highSide: highSide,
 					coords:   coords,
+					area:     area,
 				})
 			}
 		} else {
@@ -188,7 +191,7 @@ func parseContourEntries(features []*geojson.Feature) []contourEntry {
 	}
 
 	sort.Slice(closedRings, func(i, j int) bool {
-		return planar.Area(closedRings[i].geom.(orb.Polygon)) > planar.Area(closedRings[j].geom.(orb.Polygon))
+		return closedRings[i].area > closedRings[j].area
 	})
 
 	entries := append(closedRings, openLines...)
@@ -214,9 +217,6 @@ func splitPolys(poly orb.Polygon, entries []contourEntry) []orb.Polygon {
 	if len(entries) == 0 {
 		return []orb.Polygon{poly}
 	}
-	if len(entries) == 1 {
-		return trySplitPolygon(poly, entries[0])
-	}
 	polyList := trySplitPolygon(poly, entries[0])
 	for _, entry := range entries[1:] {
 		var tempPolyList []orb.Polygon
@@ -236,7 +236,8 @@ func trySplitPolygon(poly orb.Polygon, entry contourEntry) []orb.Polygon {
 	const minArea = 0.5
 	if entry.isClosed {
 		ring := entry.geom.(orb.Polygon)[0]
-		if planar.Area(orb.Polygon{ring}) < minArea {
+		// 面积解析时已缓存，无需重算
+		if entry.area < minArea {
 			return []orb.Polygon{poly}
 		}
 		if isRingInsidePolygon(ring, poly) {
@@ -291,11 +292,7 @@ func isOpenLineThroughPolygon(line orb.LineString, poly orb.Polygon) bool {
 			break
 		}
 	}
-	if !hasPointInside {
-		return false
-	}
-
-	return true
+	return hasPointInside
 }
 
 // isRingInsidePolygon 判断环是否完全位于多边形内部。
@@ -323,11 +320,9 @@ func isRingInsidePolygon(ring orb.Ring, poly orb.Polygon) bool {
 // splitByClosedRing 用闭合环切割多边形，生成外环+孔洞结构和独立的内部多边形。
 // 外部多边形保留原外环并添加孔洞，内部多边形以闭合环为外环。
 func splitByClosedRing(poly orb.Polygon, ring orb.Ring, minArea float64) []orb.Polygon {
-	outside := make(orb.Polygon, 0, len(poly)+1)
-	outside = append(outside, poly[0])
-	for i := 1; i < len(poly); i++ {
-		outside = append(outside, poly[i])
-	}
+	// 外部多边形：保留原外环及已有孔洞
+	outside := make(orb.Polygon, len(poly), len(poly)+1)
+	copy(outside, poly)
 
 	holeRing := make(orb.Ring, len(ring))
 	copy(holeRing, ring)
@@ -680,9 +675,6 @@ func buildPolygonFromSegments(seg1, seg2 orb.LineString) orb.Polygon {
 		ring.Reverse()
 	}
 	ring = utils.CloseRing(ring)
-	if len(ring) < 4 {
-		return orb.Polygon{ring}
-	}
 	return orb.Polygon{ring}
 }
 
@@ -707,12 +699,13 @@ type polyWithLevel struct {
 }
 
 // deduplicatePolygons 通过规范化后的字符串 key 去重多边形列表。
+// 返回新分配的切片，不修改调用方传入的输入切片。
 func deduplicatePolygons(polys []orb.Polygon) []orb.Polygon {
 	if len(polys) <= 1 {
 		return polys
 	}
 	seen := make(map[string]struct{})
-	result := polys[:0]
+	result := make([]orb.Polygon, 0, len(polys))
 	for _, poly := range polys {
 		key := polygonKey(poly)
 		if _, ok := seen[key]; ok {
@@ -749,26 +742,35 @@ func polygonKey(poly orb.Polygon) string {
 }
 
 // normalizeRing 将环从最小的顶点开始旋转，确保等价环的规范化形式一致。
+// 会先将未闭合的环补上闭合点再处理，保证闭合/未闭合的等价环
+// 产生相同的规范化结果（从而 polygonKey 一致，去重正确）。
 func normalizeRing(ring orb.Ring) orb.Ring {
 	if len(ring) < 3 {
 		return ring
 	}
-	n := len(ring) - 1
+	// 统一为闭合环处理，避免未闭合环少算一个顶点
+	r := ring
+	if !utils.EqPoint(r[0], r[len(r)-1], 1e-9) {
+		r = make(orb.Ring, len(ring)+1)
+		copy(r, ring)
+		r[len(ring)] = ring[0]
+	}
+	n := len(r) - 1
 	if n < 2 {
-		return ring
+		return r
 	}
 
 	minIdx := 0
 	for i := 1; i < n; i++ {
-		if ring[i][0] < ring[minIdx][0] ||
-			(math.Abs(ring[i][0]-ring[minIdx][0]) < 1e-9 && ring[i][1] < ring[minIdx][1]) {
+		if r[i][0] < r[minIdx][0] ||
+			(math.Abs(r[i][0]-r[minIdx][0]) < 1e-9 && r[i][1] < r[minIdx][1]) {
 			minIdx = i
 		}
 	}
 
 	result := make(orb.Ring, 0, n+1)
 	for i := 0; i < n; i++ {
-		result = append(result, ring[(minIdx+i)%n])
+		result = append(result, r[(minIdx+i)%n])
 	}
 	result = append(result, result[0])
 	return result
@@ -795,39 +797,39 @@ func polygonSideOfLine(poly orb.Polygon, entry contourEntry) (side string, hasSh
 	}
 
 	start, end, reversed, found := findSharedEdgeSegment(poly[0], entry.geom)
-
-	if found {
-		dx := end[0] - start[0]
-		dy := end[1] - start[1]
-		l := math.Hypot(dx, dy)
-		if l < 1e-12 {
-			return "right", true
-		}
-		mid := orb.Point{(start[0] + end[0]) / 2, (start[1] + end[1]) / 2}
-
-		// 多点采样判断：沿左法向取多个偏移距离，多数投票。
-		// 与 contour.go 的 sampleHighSide 多点采样思路一致，避免单点误判。
-		offsets := []float64{0.0005, 0.001, 0.002, 0.004}
-		leftCount := 0
-		validCount := 0
-		for _, eps := range offsets {
-			leftPt := orb.Point{mid[0] - dy/l*eps, mid[1] + dx/l*eps}
-			onLeft := planar.PolygonContains(poly, leftPt)
-			if reversed {
-				onLeft = !onLeft
-			}
-			validCount++
-			if onLeft {
-				leftCount++
-			}
-		}
-		if leftCount > validCount/2 {
-			return "left", true
-		}
-		return "right", true
+	if !found {
+		// 无方向一致的共享边段，退化为叉积判断
+		return pointSideOfLine(repPt, entry.coords), true
 	}
 
-	return pointSideOfLine(repPt, entry.coords), true
+	dx := end[0] - start[0]
+	dy := end[1] - start[1]
+	l := math.Hypot(dx, dy)
+	if l < 1e-12 {
+		return "right", true
+	}
+	mid := orb.Point{(start[0] + end[0]) / 2, (start[1] + end[1]) / 2}
+
+	// 多点采样判断：沿左法向取多个偏移距离，多数投票。
+	// 与 contour.go 的 sampleHighSide 多点采样思路一致，避免单点误判。
+	offsets := []float64{0.0005, 0.001, 0.002, 0.004}
+	leftCount := 0
+	validCount := 0
+	for _, eps := range offsets {
+		leftPt := orb.Point{mid[0] - dy/l*eps, mid[1] + dx/l*eps}
+		onLeft := planar.PolygonContains(poly, leftPt)
+		if reversed {
+			onLeft = !onLeft
+		}
+		validCount++
+		if onLeft {
+			leftCount++
+		}
+	}
+	if leftCount > validCount/2 {
+		return "left", true
+	}
+	return "right", true
 }
 
 // computePolygonLevel 为给定的多边形计算其等值线 level。
@@ -850,12 +852,18 @@ func computePolygonLevel(poly orb.Polygon, entries []contourEntry, opt *ContourO
 }
 
 // prevLevel 返回指定 level 在 LevelList 中的前一个级别。
-// 若 LevelList 中无匹配，则用 ContourInterval 估算。
+// 若 level 为 LevelList 中的最小值（无前驱），则按 ContourInterval 估算
+// （该区域位于最低等值线的低值侧，level 应低于最小级别）。
+// 若 LevelList 中无匹配，同样用 ContourInterval 估算。
 func prevLevel(level float64, opt *ContourOption) float64 {
 	if len(opt.LevelList) > 0 {
-		for i := 1; i < len(opt.LevelList); i++ {
+		for i := 0; i < len(opt.LevelList); i++ {
 			if opt.LevelList[i] == level {
-				return opt.LevelList[i-1]
+				if i > 0 {
+					return opt.LevelList[i-1]
+				}
+				// 最小 level 无前驱，回退到按间隔估算
+				break
 			}
 		}
 	}
